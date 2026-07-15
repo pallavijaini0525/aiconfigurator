@@ -19,6 +19,7 @@ import yaml
 from jinja2 import Environment, FileSystemLoader, Undefined
 from packaging.version import InvalidVersion, Version
 
+from aiconfigurator.generator import xpu_utils
 from aiconfigurator.generator.dynamo_features import (
     frontend_cli_args_string,
     kvbm_shell_exports_from_dyn_config,
@@ -1021,6 +1022,7 @@ def prepare_template_context(param_values: dict[str, Any], backend: str) -> dict
     context["model_path"] = service_config.get("model_path") or service_config.get("served_model_path", "")
     context["served_model_path"] = service_config.get("served_model_path")
     context["ServiceConfig"] = dict(service_config)
+    context["xpu_utils"] = xpu_utils
 
     # Extract K8s configuration
     k8s_config = param_values.get("K8sConfig", {})

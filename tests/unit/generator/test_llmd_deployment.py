@@ -224,6 +224,39 @@ def test_llmd_kustomize_vllm_agg_b60_mode():
 
 
 @pytest.mark.unit
+def test_llmd_kustomize_vllm_agg_b70_mode():
+    """Test that b70 also resolves to the XPU llm-d Kustomize baseline."""
+    params = {
+        "ServiceConfig": {
+            "model_path": "Qwen/Qwen3-8B",
+            "served_model_name": "Qwen/Qwen3-8B",
+            "port": 8000,
+        },
+        "DynConfig": {"mode": "agg"},
+        "NodeConfig": {"system_name": "b70"},
+        "LlmdConfig": {
+            "vllm_image": "vllm/vllm-openai:v0.20.0",
+        },
+        "WorkerConfig": {
+            "agg_workers": 1,
+            "agg_gpus_per_worker": 4,
+        },
+        "params": {
+            "agg": {"gpus_per_worker": 4},
+        },
+        "agg_tensor_parallel_size": 4,
+        "agg_pipeline_parallel_size": 1,
+        "agg_data_parallel_size": 1,
+        "agg_cli_args_list": ["--tensor-parallel-size", "4", "--max-model-len", "7000"],
+    }
+
+    artifacts = render_backend_templates(param_values=params, backend="vllm", deployment_target="llm-d-kustomize")
+
+    kustomization = yaml.safe_load(artifacts["kustomization.yaml"])
+    assert kustomization["resources"] == ["guides/optimized-baseline/modelserver/xpu/vllm"]
+
+
+@pytest.mark.unit
 def test_llmd_sglang_disagg_mode():
     """Test that sglang backend works with llm-d deployment target in disagg mode."""
     params = {

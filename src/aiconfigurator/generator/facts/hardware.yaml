@@ -166,3 +166,14 @@ profiles:
     shared_memory:
       default: 16Gi
     tolerations: []
+
+  # ---------------------------------------------------------------------------
+  # Intel Arc Pro B70  -  XPU  
+  # ---------------------------------------------------------------------------
+  b70:
+    node_selector:
+      gpu.intel.com/family: b70
+    arch: x86_64
+    shared_memory:
+      default: 16Gi
+    tolerations: []

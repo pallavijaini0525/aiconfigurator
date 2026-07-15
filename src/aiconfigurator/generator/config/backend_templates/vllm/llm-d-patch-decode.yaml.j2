@@ -12,7 +12,7 @@
 {%- set role_pp = agg_pipeline_parallel_size | default(1) if is_agg else decode_pipeline_parallel_size | default(1) -%}
 {%- set role_gpu = (role_tp | int) * (role_pp | int) -%}
 {%- set role_cli_args = agg_cli_args_list | default([]) if is_agg else decode_cli_args_list | default([]) -%}
-{%- set default_accelerator_type = 'xpu' if node_config.system_name | default('') == 'b60' else 'nvidia' -%}
+{%- set default_accelerator_type = xpu_utils.get_accelerator_type(node_config.system_name | default('')) -%}
 {%- set accelerator_type = llmd_config.accelerator_type | default(default_accelerator_type, true) -%}
 {%- set is_xpu = accelerator_type in ['xpu', 'intel'] -%}
 {%- set xpu_rdma_enabled = llmd_config.xpu_rdma_enabled | default(false) -%}

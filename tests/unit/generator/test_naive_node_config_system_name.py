@@ -60,3 +60,14 @@ def test_non_b60_system_is_preserved():
         backend_name="vllm",
     )
     assert result["NodeConfig"]["system_name"] == "h200_sxm"
+
+
+
+def test_b70_system_is_preserved():
+    result = build_naive_generator_params(
+        model_name="Qwen/Qwen3-8B",
+        total_gpus=1,
+        system_name="b70",
+        backend_name="vllm",
+    )
+    assert result["NodeConfig"]["system_name"] == "b70"
