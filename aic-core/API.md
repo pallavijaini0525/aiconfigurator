@@ -34,6 +34,24 @@ from aiconfigurator_core.sdk.rust_engine_step import RustForwardPassPerfModel
 from aiconfigurator_core.sdk.memory import estimate_kv_cache, estimate_num_gpu_blocks
 ```
 
+The large-EP MoE communication family is exposed as an explicit module path
+(it is not part of the facade):
+
+```python
+from aiconfigurator_core.sdk.operations.moe_comm import MOE_A2A_BACKENDS, EPMoE, MoEAllToAll
+```
+
+`MOE_A2A_BACKENDS` maps each supported MoE all-to-all comm backend to its
+`MoECommBackendSpec` (framework and phase applicability plus feasibility
+rules). `MoEAllToAll` and `EPMoE` are the operation classes over the unified
+`moe_a2a_perf` comm and `moe_ep_perf` expert-compute tables. `PerfDatabase`
+(`aiconfigurator_core.sdk.perf_database`) forwards to them through
+`query_moe_a2a(...)` and `query_moe_ep(...)` and adds the read-only coverage
+probes `moe_a2a_coverage(...)` and `moe_ep_compute_coverage(...)`. These
+queries serve measured silicon data only: SOL and empirical database modes
+raise `EmpiricalNotImplementedError`, with an estimation tier as a planned
+follow-up.
+
 `aiconfigurator_core.sdk.__all__` is the supported high-level surface. The
 facade resolves lazily, so importing it does not load the model registry,
 performance database, or native engine until a name is used.
@@ -62,6 +80,11 @@ models and missing or unreadable model, system, or performance data. Check
 `diagnostics()` to determine whether the active source is `aic`,
 `aic_with_correction`, or `fallback_regression`, and to inspect any fallback
 warning.
+
+Native online corrections default to an absolute factor range of `[0.5, 2.0]`.
+Pass `None` explicitly as `min_faster_correction_factor` or
+`max_slower_correction_factor` in the options dictionary to remove the bound
+in that direction. Regression fallback ignores both options.
 
 Use `from_native(...)` instead when native AIC support is required and an
 unsupported configuration or native data failure should surface rather than
@@ -121,8 +144,11 @@ The supported root-level Rust surface is grouped as follows:
   `ENGINE_SPEC_SCHEMA_VERSION`, and `FPM_VERSION`.
 
 Advanced consumers may use `engine::{Engine, RuntimeConfig, StaticMode,
-StaticResult}` and `engine::spec::{EngineSpec, OpSpec}` to load and execute a
-previously compiled specification directly.
+StaticResult, PerOpValue}` and `engine::spec::{EngineSpec, OpSpec}` to load and
+execute a previously compiled specification directly. `PerOpValue` is the
+per-op result tuple `(name, latency_ms, energy_wms, source)` returned by the
+`*_per_op` / `evaluate_*` methods (the thin op-list evaluation FFI); per-op
+energy is 0.0 wherever the perf tables carry no power columns.
 
 ## Compatibility rules
 

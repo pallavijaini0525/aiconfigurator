@@ -45,9 +45,11 @@ from aiconfigurator.sdk.errors import (
     InsufficientMemoryError,
     KVCacheCapacityError,
     NoFeasibleConfigError,
+    PerfDataNotAvailableError,
 )
 from aiconfigurator.sdk.models import get_model
 from aiconfigurator.sdk.perf_database import PerfDatabase
+from aiconfigurator.sdk.picking import parallel_dim, worker_gpus
 from aiconfigurator.sdk.predict import predict_agg_worker, predict_disagg_worker
 from aiconfigurator.sdk.speculative import SpeculativeDecodingProfile
 from aiconfigurator.sdk.utils import enumerate_ttft_tpot_constraints
@@ -117,8 +119,8 @@ def _rate_match_dict(
         p["seq/s"] * prefill_num_worker * prefill_degradation,
         d["seq/s"] * decode_num_worker * decode_degradation,
     )
-    prefill_gpus = p["pp"] * p["tp"] * p["dp"]
-    decode_gpus = d["pp"] * d["tp"] * d["dp"]
+    prefill_gpus = worker_gpus(p)
+    decode_gpus = worker_gpus(d)
     num_total_gpus = prefill_gpus * prefill_num_worker + decode_gpus * decode_num_worker
     seq_s_gpu = seq_s / num_total_gpus if num_total_gpus > 0 else 0.0
     tokens_s = seq_s * osl
@@ -167,7 +169,7 @@ def _rate_match_dict(
         "(p)dp": p["dp"],
         "(p)moe_tp": p["moe_tp"],
         "(p)moe_ep": p["moe_ep"],
-        "(p)cp": p.get("cp", 1),
+        "(p)cp": parallel_dim(p.get("cp")),
         "(p)parallel": p["parallel"],
         "(p)gemm": p["gemm"],
         "(p)kvcache": p["kvcache"],
@@ -276,7 +278,7 @@ def _sweep_one_parallel_agg(
     a full recomputation per tpot, ~80x slowdown for an 80-element tpot
     sweep.
 
-    Returns ``(rows_df, saw_model_fit, saw_memory_fit)``.  Logic faithfully
+    Returns ``(rows_df, saw_model_fit, saw_memory_fit, perf_misses)``.  Logic faithfully
     reproduces the body of the legacy
     ``backend.find_best_agg_result_under_constraints``; parity is enforced by
     the integration test.
@@ -302,6 +304,7 @@ def _sweep_one_parallel_agg(
     capped_b: list[int] = []
     saw_model_fit = False
     saw_memory_fit = False
+    perf_misses = 0
 
     for b in b_list:
         for ctx_tokens in ctx_tokens_list:
@@ -332,16 +335,23 @@ def _sweep_one_parallel_agg(
             if free_gpu_memory_fraction is not None:
                 backend_kwargs["free_gpu_memory_fraction"] = free_gpu_memory_fraction
 
-            summary = predict_agg_worker(
-                model=model,
-                backend=backend,
-                database=database,
-                runtime_config=point_rt,
-                ctx_tokens=ctx_tokens,
-                predictor=predictor,
-                speculative_profile=speculative_profile,
-                **backend_kwargs,
-            )
+            try:
+                summary = predict_agg_worker(
+                    model=model,
+                    backend=backend,
+                    database=database,
+                    runtime_config=point_rt,
+                    ctx_tokens=ctx_tokens,
+                    predictor=predictor,
+                    speculative_profile=speculative_profile,
+                    **backend_kwargs,
+                )
+            except PerfDataNotAvailableError:
+                # This batch/ctx point is unanswerable (e.g. an FPM query
+                # beyond the collected domain, which never extrapolates);
+                # the point is infeasible, not the whole parallel config.
+                perf_misses += 1
+                continue
 
             model_oom = summary.check_oom()
             kv_cache_oom = summary.check_kv_cache_oom()
@@ -355,14 +365,14 @@ def _sweep_one_parallel_agg(
                 results_per_ops_source.append(summary.get_per_ops_source())
 
     if not results_dict_list:
-        return pd.DataFrame(columns=common.ColumnsAgg), saw_model_fit, saw_memory_fit
+        return pd.DataFrame(columns=common.ColumnsAgg), saw_model_fit, saw_memory_fit, perf_misses
 
     df = pd.DataFrame(results_dict_list, columns=common.ColumnsAgg).round(3)
     df["_per_ops_source"] = results_per_ops_source
     df = df.sort_values(by="seq/s", ascending=False).round(3)
     if top_k > 0:
         df = df.head(top_k)
-    return df, saw_model_fit, saw_memory_fit
+    return df, saw_model_fit, saw_memory_fit, perf_misses
 
 
 def sweep_agg(
@@ -426,6 +436,7 @@ def sweep_agg(
     exceptions: list[Exception] = []
     saw_model_fit = False
     saw_memory_fit = False
+    perf_misses = 0
 
     for parallel_config in parallel_config_list:
         tp_size, pp_size, dp_size, moe_tp_size, moe_ep_size, cp_size = parallel_config
@@ -482,7 +493,7 @@ def sweep_agg(
                 continue
 
             for point_rt in runtime_configs_to_evaluate:
-                point_df, point_saw_model_fit, point_saw_memory_fit = _sweep_one_parallel_agg(
+                point_df, point_saw_model_fit, point_saw_memory_fit, point_perf_misses = _sweep_one_parallel_agg(
                     model=model,
                     backend=backend,
                     database=database,
@@ -498,6 +509,7 @@ def sweep_agg(
                 )
                 saw_model_fit |= point_saw_model_fit
                 saw_memory_fit |= point_saw_memory_fit
+                perf_misses += point_perf_misses
                 if len(point_df) == 0:
                     continue
                 if len(results_df) == 0:
@@ -527,6 +539,13 @@ def sweep_agg(
             f"sweep_agg: no results for any parallel configuration. Last exception: {exceptions[-1]}"
         ) from exceptions[-1]
     if not saw_model_fit:
+        if perf_misses:
+            raise NoFeasibleConfigError(
+                f"sweep_agg: no results — {perf_misses} batch point(s) had no answerable perf data "
+                "(e.g. FPM queries outside the collected domain, or no collected cell matches the "
+                "model identity/quant modes). Check the collected cells against the resolved quant "
+                "configuration, or use forward_model='op_level'."
+            )
         raise InsufficientMemoryError(
             "sweep_agg: no results — model does not fit in GPU memory for any parallel config. "
             "Try increasing --total-gpus, using a quantized model, or a system with more VRAM per GPU."
@@ -572,6 +591,7 @@ def _get_disagg_worker_candidates(
     result_rows: list[pd.DataFrame] = []
     exceptions: list[Exception] = []
     all_configs_oom = True
+    perf_misses = 0
 
     for parallel_config in parallel_config_list:
         tp_size, pp_size, dp_size, moe_tp_size, moe_ep_size, cp_size = parallel_config
@@ -600,17 +620,23 @@ def _get_disagg_worker_candidates(
 
             for b in b_list:
                 point_rt = dataclasses.replace(runtime_config, batch_size=b)
-                summary = predict_disagg_worker(
-                    model=model,
-                    backend=backend,
-                    database=database,
-                    runtime_config=point_rt,
-                    role=role,  # type: ignore[arg-type]
-                    latency_correction=latency_correction,
-                    predictor=predictor,
-                    speculative_profile=speculative_profile,
-                    free_gpu_memory_fraction=free_gpu_memory_fraction,
-                )
+                try:
+                    summary = predict_disagg_worker(
+                        model=model,
+                        backend=backend,
+                        database=database,
+                        runtime_config=point_rt,
+                        role=role,  # type: ignore[arg-type]
+                        latency_correction=latency_correction,
+                        predictor=predictor,
+                        speculative_profile=speculative_profile,
+                        free_gpu_memory_fraction=free_gpu_memory_fraction,
+                    )
+                except PerfDataNotAvailableError:
+                    # Unanswerable batch point (e.g. FPM out-of-domain):
+                    # skip the point, keep the parallel config.
+                    perf_misses += 1
+                    continue
                 if not summary.check_oom() and not summary.check_kv_cache_oom():
                     all_configs_oom = False
                     result_rows.append(summary.get_summary_df())
@@ -643,6 +669,13 @@ def _get_disagg_worker_candidates(
                 f"sweep_disagg/{role}: no results for any parallel config. Last exception: {exceptions[-1]}"
             ) from exceptions[-1]
         if all_configs_oom:
+            if perf_misses:
+                raise NoFeasibleConfigError(
+                    f"sweep_disagg/{role}: no results — {perf_misses} batch point(s) had no answerable "
+                    "perf data (e.g. FPM queries outside the collected domain, or no collected cell "
+                    "matches the model identity/quant modes). Check the collected cells against the "
+                    "resolved quant configuration, or use forward_model='op_level'."
+                )
             raise InsufficientMemoryError(
                 f"sweep_disagg/{role}: no results — model does not fit in GPU memory for any parallel config. "
                 "Try increasing GPU budget, using a quantized model, or a system with more VRAM per GPU."
@@ -896,6 +929,8 @@ def sweep_disagg(
             target_tpot=target_tpot_v,
             top_n=5,
             ttft_correction_factor=ttft_corr,
+            prefill_degradation_factor=p_deg,
+            decode_degradation_factor=d_deg,
         )
         df = result["best_config_df"]
         if df is None or df.empty:
@@ -984,3 +1019,102 @@ def sweep_disagg(
         .sort_values(by="tokens/s/gpu", ascending=False)
         .reset_index(drop=True)
     )
+
+
+# ---------------------------------------------------------------------------
+# AFD sweep
+# ---------------------------------------------------------------------------
+
+
+def sweep_afd(
+    *,
+    model_path: str,
+    runtime_config: config.RuntimeConfig,
+    database: PerfDatabase,
+    backend_name: str,
+    model_config: config.ModelConfig,
+    afd_parallel_config_list: list[tuple[int, int, int, int, int, str]],
+    gpus_per_node: int,
+    total_gpus: int | None = None,
+    combined_with_pd: bool = True,
+    comm_overhead_factor: float = 1.0,
+    boundary_on_attn: bool = True,
+    total_batch_size: int | None = None,
+    max_a_batch_size: int = 1024,
+    target_ttft: float | None = None,
+    free_gpu_memory_fraction: float | None = None,
+    max_seq_len: int | None = None,
+    # combined-with-PD prefill options
+    prefill_database: PerfDatabase | None = None,
+    prefill_backend_name: str | None = None,
+    prefill_model_config: config.ModelConfig | None = None,
+    prefill_parallel_config_list: list | None = None,
+    prefill_batch_size_list: list[int] | None = None,
+    prefill_system_name: str | None = None,
+    prefill_backend_version: str | None = None,
+    prefill_max_candidates: int = 256,
+    prefill_candidate_overflow: str = "error",
+    max_prefill_gpus: int | None = None,
+    max_prefill_workers: int | None = None,
+    # calibration
+    prefill_degradation: float | None = None,
+    decode_degradation: float | None = None,
+    ttft_correction_factor: float | None = None,
+    decode_latency_correction: float = 1.0,
+) -> pd.DataFrame:
+    """Sweep AFD candidate topologies; return feasible-candidate DataFrame.
+
+    Thin wrapper around :func:`pareto_analysis.afd_pareto` that matches the
+    interface pattern of :func:`sweep_agg` / :func:`sweep_disagg`.
+
+    Returns:
+        DataFrame with :data:`common.ColumnsAFD` schema sorted by
+        ``tokens/s/gpu`` descending.
+
+    Raises:
+        NoFeasibleConfigError: When no candidate satisfies the SLA.
+    """
+    from aiconfigurator.sdk.pareto_analysis import (
+        _AFD_DECODE_DEGRADATION,
+        _AFD_PREFILL_DEGRADATION,
+        _AFD_TTFT_CORRECTION_FACTOR,
+        afd_pareto,
+    )
+
+    if not afd_parallel_config_list:
+        raise NoFeasibleConfigError("sweep_afd: empty afd_parallel_config_list — no AFD topologies to evaluate.")
+
+    result_df = afd_pareto(
+        model_path=model_path,
+        runtime_config=runtime_config,
+        database=database,
+        backend_name=backend_name,
+        afd_parallel_config_list=afd_parallel_config_list,
+        gpus_per_node=gpus_per_node,
+        model_config=model_config,
+        total_gpus=total_gpus,
+        combined_with_pd=combined_with_pd,
+        comm_overhead_factor=comm_overhead_factor,
+        boundary_on_attn=boundary_on_attn,
+        total_batch_size=total_batch_size,
+        max_a_batch_size=max_a_batch_size,
+        target_ttft=target_ttft,
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        max_seq_len=max_seq_len,
+        prefill_database=prefill_database,
+        prefill_backend_name=prefill_backend_name,
+        prefill_model_config=prefill_model_config,
+        prefill_parallel_config_list=prefill_parallel_config_list,
+        prefill_batch_size_list=prefill_batch_size_list,
+        prefill_system_name=prefill_system_name,
+        prefill_backend_version=prefill_backend_version,
+        prefill_max_candidates=prefill_max_candidates,
+        prefill_candidate_overflow=prefill_candidate_overflow,
+        max_prefill_gpus=max_prefill_gpus,
+        max_prefill_workers=max_prefill_workers,
+        prefill_degradation=prefill_degradation or _AFD_PREFILL_DEGRADATION,
+        decode_degradation=decode_degradation or _AFD_DECODE_DEGRADATION,
+        ttft_correction_factor=ttft_correction_factor or _AFD_TTFT_CORRECTION_FACTOR,
+        decode_latency_correction=decode_latency_correction,
+    )
+    return result_df

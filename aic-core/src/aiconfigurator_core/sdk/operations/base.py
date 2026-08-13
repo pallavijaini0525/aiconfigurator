@@ -121,12 +121,30 @@ def _version_dir_is_partial(version_dir: str) -> bool:
     return os.path.isfile(os.path.join(version_dir, "INCOMPLETE.txt"))
 
 
+def _version_dir_is_unusable(version_dir: str) -> bool:
+    """Whether the whole directory must be excluded from data loading.
+
+    ``collection_meta.yaml`` with ``status: partial`` is structured coverage
+    metadata: successfully collected rows are valid and must remain primary,
+    while older versions fill missing coordinates. Only legacy
+    ``INCOMPLETE.txt`` lacks enough granularity to admit any of its rows.
+
+    A structured sidecar supersedes a stale legacy marker. Parse validation is
+    owned by perf_database's admission layer; this hot-path resolver only needs
+    to know that the structured sidecar exists.
+    """
+    if os.path.isfile(os.path.join(version_dir, "collection_meta.yaml")):
+        return False
+    return os.path.isfile(os.path.join(version_dir, "INCOMPLETE.txt"))
+
+
 def resolve_op_data_path(system_data_root: str, backend: str, version: str, op_filename: str) -> str:
     """Resolve one op table under the family-first layout, legacy fallback.
 
     Family dirs are discovered structurally (any first-level dir that is not
-    a known backend dir); dirs marked partial (yaml-first, txt fallback — see
-    ``_version_dir_is_partial``) are skipped. Candidates run through the
+    a known backend dir). Structured partial tables are loadable and use
+    older-version shape fill; only legacy whole-dir-incomplete directories
+    (see ``_version_dir_is_unusable``) are skipped. Candidates run through the
     .parquet->.txt fallback. When nothing exists, returns the legacy-shaped
     path so callers keep their missing-file semantics.
     """
@@ -139,7 +157,7 @@ def resolve_op_data_path(system_data_root: str, backend: str, version: str, op_f
         if entry.startswith(".") or entry in _KNOWN_BACKEND_DIRS:
             continue
         version_dir = os.path.join(system_data_root, entry, backend, version)
-        if not os.path.isdir(version_dir) or _version_dir_is_partial(version_dir):
+        if not os.path.isdir(version_dir) or _version_dir_is_unusable(version_dir):
             continue
         candidate = _resolve_perf_data_path(os.path.join(version_dir, op_filename))
         if os.path.exists(candidate):
@@ -195,7 +213,7 @@ class Operation:
 
     Note: query() returns PerformanceResult (float-like) instead of plain float.
     The class behaves as a float for backward compatibility while carrying
-    energy data and a ``source`` tag ("silicon" / "empirical" / "mixed").
+    energy data and a provenance ``source`` tag; see ``PerformanceResult``.
     """
 
     # Subclasses that own CSV data override this. Keyed by (system_path, db_mode).
@@ -300,8 +318,10 @@ def clear_all_op_caches() -> None:
       fixture clears only the counter, not data caches — clearing the
       caches would force a fresh-disk reload mid-suite)
 
-    Also clears empirical utilization grids and the shared instrumentation
-    counter. Util grids are derived from per-op data, so retaining them after
+    Also clears empirical utilization grids, the shared instrumentation
+    counter, and the compiled-engine handle LRU (each ``EngineHandle`` pins a
+    Rust-side perf-DB load, so it belongs to the same eviction contract).
+    Util grids are derived from per-op data, so retaining them after
     their source caches are evicted can mix an old custom ``systems_root`` or
     shared-layer view into newly loaded data.
 
@@ -318,6 +338,11 @@ def clear_all_op_caches() -> None:
 
     util_empirical.clear_grid_cache()
     Operation._load_data_call_count.clear()
+    # Lazy for the same cycle reason (rust_engine_step is imported by engine.py,
+    # which imports operation modules).
+    from aiconfigurator_core.sdk import rust_engine_step
+
+    rust_engine_step._engine_handle_cache_clear()
 
 
 def warm_all_op_data(database: PerfDatabase) -> None:

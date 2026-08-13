@@ -73,7 +73,11 @@ struct BincodeWire {
 
 impl EngineSpec {
     /// Build a spec, stamping the current [`ENGINE_SPEC_SCHEMA_VERSION`].
-    pub fn new(engine: EngineConfig, context_ops: Vec<OpSpec>, generation_ops: Vec<OpSpec>) -> Self {
+    pub fn new(
+        engine: EngineConfig,
+        context_ops: Vec<OpSpec>,
+        generation_ops: Vec<OpSpec>,
+    ) -> Self {
         Self {
             schema_version: ENGINE_SPEC_SCHEMA_VERSION,
             engine,
@@ -156,16 +160,15 @@ mod tests {
     use crate::common::enums::{
         BackendKind, CommQuantMode, FmhaQuantMode, GemmQuantMode, KvCacheQuantMode, MoeQuantMode,
     };
+    use crate::operators::moe_dispatch::DispatchFlavor;
     use crate::operators::op::{FallbackOp, OverlapOp};
     use crate::operators::{
         ContextAttentionOp, ContextMlaOp, CustomAllReduceOp, DsaModuleOp, Dsv4MegaMoeOp,
-        Dsv4ModuleOp,
-        ElementwiseOp, EmbeddingOp, EncoderAttentionOp, GdnOp, GemmOp, GenerationAttentionOp,
-        GenerationMlaOp, Mamba2Op, MhcModuleOp, MlaBmmOp, MlaModuleOp, MoEDispatchOp, MoeOp,
-        NcclOp, P2POp, TrtllmWideEpMoEDispatchOp, VisionEncoderOp, WideEpContextMlaOp,
-        WideEpGenerationMlaOp, WideEpMoeOp,
+        Dsv4ModuleOp, ElementwiseOp, EmbeddingOp, EncoderAttentionOp, GdnOp, GemmOp,
+        GenerationAttentionOp, GenerationMlaOp, KdaOp, Mamba2Op, MhcModuleOp, MlaBmmOp,
+        MlaModuleOp, MoEDispatchOp, MoeOp, NcclOp, P2POp, TrtllmWideEpMoEDispatchOp,
+        VisionEncoderOp, WideEpContextMlaOp, WideEpGenerationMlaOp, WideEpMoeOp,
     };
-    use crate::operators::moe_dispatch::DispatchFlavor;
     use crate::perf_database::dsv4::AttnKind;
     use crate::{
         DataType, ParallelMapping, QuantizationConfig, SpeculativeConfig,
@@ -183,7 +186,8 @@ mod tests {
             quant_mode: GemmQuantMode::Fp8,
             scale_num_tokens: 0,
             low_precision_input: true,
-                seq_split: 1,
+            seq_split: 1,
+            below_grid_sol: false,
         }
     }
 
@@ -274,6 +278,7 @@ mod tests {
             kv_cache_dtype: KvCacheQuantMode::Fp8,
             fmha_quant_mode: FmhaQuantMode::Fp8,
             gemm_quant_mode: GemmQuantMode::Fp8Block,
+            native_num_heads: Some(128),
         }
     }
 
@@ -326,6 +331,7 @@ mod tests {
             is_context: false,
             sms: 12,
             scale_num_tokens: 1,
+            attn_ar_modeled: false,
         }
     }
 
@@ -469,6 +475,7 @@ mod tests {
             architecture: "DeepseekV4ForCausalLM".into(),
             sinkhorn_iters: 20,
             quant_mode: GemmQuantMode::Bfloat16,
+            seq_split: 1,
         }
     }
 
@@ -500,6 +507,22 @@ mod tests {
             head_k_dim: 128,
             num_v_heads: 32,
             head_v_dim: 128,
+        }
+    }
+
+    fn kda() -> KdaOp {
+        KdaOp {
+            name: "kda".into(),
+            scale_factor: 1.0,
+            kernel_source: "fused_sigmoid_gating_delta_rule_update".into(),
+            phase: "verify".into(),
+            d_model: 7168,
+            d_conv: 4,
+            num_k_heads: 16,
+            head_k_dim: 128,
+            num_v_heads: 16,
+            head_v_dim: 128,
+            draft_tokens: 4,
         }
     }
 
@@ -569,6 +592,31 @@ mod tests {
         }
     }
 
+    fn fpm_forward() -> crate::operators::FpmForwardOp {
+        // Recursive like Overlap/Fallback: sol_ops carries the model's
+        // original granular list, so the round-trip must preserve nesting.
+        crate::operators::FpmForwardOp {
+            name: "fpm_forward_prefill".into(),
+            phase: crate::operators::FpmPhase::Prefill,
+            model_path: "org/model-a".into(),
+            match_identity: vec![
+                "nvfp4".into(),
+                "nvfp4".into(),
+                "bfloat16".into(),
+                "half".into(),
+                "fp8".into(),
+                "4".into(),
+                "1".into(),
+                "1".into(),
+                "4".into(),
+                "1".into(),
+                "1".into(),
+            ],
+            weight_bytes: 1.5e10,
+            sol_ops: vec![OpSpec::Gemm(gemm()), OpSpec::ContextAttention(context_attention())],
+        }
+    }
+
     fn fallback() -> FallbackOp {
         // Recursive: a primary module op with a granular per-kernel fallback
         // chain that itself contains a nested Overlap.
@@ -618,11 +666,14 @@ mod tests {
             OpSpec::WideEpGenerationMla(wideep_generation_mla()),
             OpSpec::WideEpMoe(wideep_moe()),
             OpSpec::WideEpMoeDispatch(wideep_moe_dispatch()),
+            OpSpec::FpmForward(fpm_forward()),
             OpSpec::Overlap(overlap()),
             OpSpec::Fallback(fallback()),
             // Appended AFTER Fallback (bincode enum indices are positional;
             // appending shifts nothing, so no ENGINE_SPEC_SCHEMA_VERSION bump).
             OpSpec::Dsv4MegaMoe(dsv4_megamoe()),
+            // Appended at the very end (schema_version 5: Kda variant).
+            OpSpec::Kda(kda()),
         ];
 
         // Exhaustiveness guard: if a variant is added to `Op`, this match
@@ -659,9 +710,11 @@ mod tests {
                 | OpSpec::WideEpGenerationMla(_)
                 | OpSpec::WideEpMoe(_)
                 | OpSpec::WideEpMoeDispatch(_)
+                | OpSpec::FpmForward(_)
                 | OpSpec::Overlap(_)
                 | OpSpec::Fallback(_)
-                | OpSpec::Dsv4MegaMoe(_) => {}
+                | OpSpec::Dsv4MegaMoe(_)
+                | OpSpec::Kda(_) => {}
             }
         }
         ops
@@ -675,6 +728,7 @@ mod tests {
             systems_path: None,
             backend: crate::BackendKind::Trtllm,
             backend_version: Some("1.0.0rc3".into()),
+            forward_model: None,
             kv_block_size: Some(64),
             parallel: ParallelMapping {
                 tp_size: 8,
@@ -690,9 +744,7 @@ mod tests {
                 activation_dtype: Some(DataType::Fp8),
                 kv_cache_dtype: Some(DataType::Fp8),
             },
-            speculative: Some(SpeculativeConfig {
-                nextn: Some(1),
-            }),
+            speculative: Some(SpeculativeConfig { nextn: Some(1) }),
             perf_db_sources: Default::default(),
             database_mode: Default::default(),
             transfer_policy: None,
@@ -723,6 +775,26 @@ mod tests {
         let bytes = bincode::serialize(&op).unwrap();
         let decoded: OpSpec = bincode::deserialize(&bytes).unwrap();
         assert_eq!(op, decoded);
+    }
+
+    #[test]
+    fn mla_module_none_native_round_trips_followed_by_another_op() {
+        // native_num_heads=None must still be serialized (no skip_serializing_if):
+        // bincode decodes positionally, so an omitted Option would desync the
+        // ops decoded after it (#1458 review).
+        let mut none_native = mla_module();
+        none_native.native_num_heads = None;
+        let spec = EngineSpec::new(
+            sample_engine_config(),
+            vec![OpSpec::MlaModuleContext(none_native), OpSpec::Gemm(gemm())],
+            vec![
+                OpSpec::MlaModuleGeneration(mla_module()),
+                OpSpec::Moe(moe()),
+            ],
+        );
+        let bytes = spec.to_bincode().expect("to_bincode");
+        let decoded = EngineSpec::from_bincode(&bytes).expect("from_bincode");
+        assert_eq!(spec, decoded);
     }
 
     #[test]
@@ -761,7 +833,10 @@ mod tests {
     fn version_skew_reports_unsupported_before_payload_decode() {
         let spec = EngineSpec::new(
             sample_engine_config(),
-            vec![OpSpec::Gemm(gemm()), OpSpec::ContextAttention(context_attention())],
+            vec![
+                OpSpec::Gemm(gemm()),
+                OpSpec::ContextAttention(context_attention()),
+            ],
             vec![OpSpec::GenerationAttention(generation_attention())],
         );
         let mut bytes = spec.to_bincode().expect("to_bincode");
@@ -775,14 +850,18 @@ mod tests {
         bytes.truncate(bytes.len() - 8);
 
         match EngineSpec::from_bincode(&bytes) {
-            Err(AicError::UnsupportedSchemaVersion { kind, got, expected }) => {
+            Err(AicError::UnsupportedSchemaVersion {
+                kind,
+                got,
+                expected,
+            }) => {
                 assert_eq!(kind, "EngineSpec");
                 assert_eq!(got, foreign);
                 assert_eq!(expected, ENGINE_SPEC_SCHEMA_VERSION);
             }
-            other => panic!(
-                "expected UnsupportedSchemaVersion before payload decode, got {other:?}"
-            ),
+            other => {
+                panic!("expected UnsupportedSchemaVersion before payload decode, got {other:?}")
+            }
         }
     }
 
@@ -790,7 +869,10 @@ mod tests {
     fn handshake_spec() -> EngineSpec {
         EngineSpec::new(
             sample_engine_config(),
-            vec![OpSpec::Gemm(gemm()), OpSpec::ContextAttention(context_attention())],
+            vec![
+                OpSpec::Gemm(gemm()),
+                OpSpec::ContextAttention(context_attention()),
+            ],
             vec![OpSpec::GenerationAttention(generation_attention())],
         )
     }
@@ -799,8 +881,8 @@ mod tests {
     #[test]
     fn from_bincode_round_trips_and_preserves_version() {
         let spec = handshake_spec();
-        let decoded =
-            EngineSpec::from_bincode(&spec.to_bincode().expect("to_bincode")).expect("from_bincode");
+        let decoded = EngineSpec::from_bincode(&spec.to_bincode().expect("to_bincode"))
+            .expect("from_bincode");
         assert_eq!(decoded, spec);
         assert_eq!(decoded.schema_version, ENGINE_SPEC_SCHEMA_VERSION);
     }
@@ -829,7 +911,11 @@ mod tests {
         bytes[..4].copy_from_slice(&foreign.to_le_bytes()); // only the prefix changes
 
         match EngineSpec::from_bincode(&bytes) {
-            Err(AicError::UnsupportedSchemaVersion { kind, got, expected }) => {
+            Err(AicError::UnsupportedSchemaVersion {
+                kind,
+                got,
+                expected,
+            }) => {
                 assert_eq!(kind, "EngineSpec");
                 assert_eq!(got, foreign);
                 assert_eq!(expected, ENGINE_SPEC_SCHEMA_VERSION);

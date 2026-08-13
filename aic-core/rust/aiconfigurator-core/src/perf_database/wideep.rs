@@ -48,13 +48,15 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use super::axis_curve::AxisCurve;
+use super::moe::MoeSiblingSlice;
+use super::moe_index::{MoeIndex, MoeShapeKey};
+use super::perf_interp::{self, Node, OpInterpConfig};
+use super::{kernel_source_ok, resolve_op_sources};
 use crate::common::enums::MoeQuantMode;
 use crate::common::error::AicError;
 use crate::common::system_spec::SystemSpec;
 use crate::config::{PerfDbSources, PerfSource};
-use super::perf_interp::{self, Node, OpInterpConfig};
-use super::{kernel_source_ok, resolve_op_sources};
-use super::moe::{query_token_curve, singleton_underflow, MoeSiblingSlice};
 use crate::perf_database::parquet_loader::PerfReader;
 
 pub struct WideEpTable {
@@ -77,7 +79,7 @@ pub struct WideEpTable {
 }
 
 struct MoeGrids {
-    by_keys: BTreeMap<MoeKey, BTreeMap<u32, f64>>,
+    index: MoeIndex<MoeShapeKey, AxisCurve>,
     /// Distinct quant names in first-seen (file row) order — Python's dict
     /// insertion order, consumed by the operator-layer transfer ladder
     /// (same contract as `moe.rs::MoeTable::available_quants`).
@@ -90,7 +92,7 @@ struct MoeGrids {
 /// `distribution` axis (the parquet column is ignored, as in Python) and NO
 /// `inter_size`/`moe_tp_size`.
 struct AlltoallGrids {
-    by_keys: BTreeMap<AlltoallKey, BTreeMap<u32, f64>>,
+    by_keys: BTreeMap<AlltoallKey, AxisCurve>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -106,14 +108,158 @@ struct AlltoallKey {
 }
 
 struct DispatchGrids {
-    by_keys: BTreeMap<DispatchKey, BTreeMap<u32, DispatchPoint>>,
+    by_keys: BTreeMap<DispatchKey, DispatchCurve>,
 }
 
 /// DeepEP-normal grids carry the `dispatch_sms` level Python keys by
 /// (`moe.py::load_wideep_deepep_normal_data`:
 /// `[node_num][hidden_size][topk][num_experts][dispatch_sms][num_token]`).
 struct NormalDispatchGrids {
-    by_keys: BTreeMap<DispatchKey, BTreeMap<u32, BTreeMap<u32, DispatchPoint>>>,
+    by_keys: BTreeMap<DispatchKey, NormalDispatchSlice>,
+}
+
+struct NormalDispatchSlice {
+    by_sms: BTreeMap<u32, DispatchPoints>,
+    direct_fields: Option<[AxisCurve; DispatchField::COUNT]>,
+    fields: [Node; DispatchField::COUNT],
+    /// Python's table leaf: the four normal-mode components summed
+    /// ([`normal_leaf_sum`]). The hold path resolves THIS node so the total
+    /// matches Python exactly (util blending is nonlinear in the leaf).
+    summed: Node,
+}
+
+struct DispatchCurve {
+    points: DispatchPoints,
+    fields: [AxisCurve; DispatchField::COUNT],
+}
+
+struct DispatchPoints {
+    points: Box<[(u32, DispatchPoint)]>,
+}
+
+#[derive(Clone, Copy)]
+enum DispatchField {
+    DispatchTransmit,
+    DispatchNotify,
+    CombineTransmit,
+    CombineNotify,
+    CombineAverage,
+    DispatchAverage,
+}
+
+impl DispatchField {
+    const COUNT: usize = 6;
+    const ALL: [Self; Self::COUNT] = [
+        Self::DispatchTransmit,
+        Self::DispatchNotify,
+        Self::CombineTransmit,
+        Self::CombineNotify,
+        Self::CombineAverage,
+        Self::DispatchAverage,
+    ];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn value(self, point: DispatchPoint) -> f64 {
+        match self {
+            Self::DispatchTransmit => point.dispatch_transmit_us,
+            Self::DispatchNotify => point.dispatch_notify_us,
+            Self::CombineTransmit => point.combine_transmit_us,
+            Self::CombineNotify => point.combine_notify_us,
+            Self::CombineAverage => point.combine_avg_t_us,
+            Self::DispatchAverage => point.dispatch_avg_t_us,
+        }
+    }
+}
+
+impl DispatchCurve {
+    fn new(points: BTreeMap<u32, DispatchPoint>) -> Self {
+        let fields = dispatch_fields(&points);
+        Self {
+            points: DispatchPoints::new(points),
+            fields,
+        }
+    }
+}
+
+impl DispatchPoints {
+    fn new(points: BTreeMap<u32, DispatchPoint>) -> Self {
+        assert!(
+            !points.is_empty(),
+            "dispatch curves must carry at least one token point"
+        );
+        Self {
+            points: points.into_iter().collect(),
+        }
+    }
+
+    fn get(&self, token: u32) -> Option<DispatchPoint> {
+        self.points
+            .binary_search_by_key(&token, |&(token, _)| token)
+            .ok()
+            .map(|index| self.points[index].1)
+    }
+
+    fn first(&self) -> (u32, DispatchPoint) {
+        *self
+            .points
+            .first()
+            .expect("DispatchPoints is non-empty by construction")
+    }
+
+    fn last(&self) -> (u32, DispatchPoint) {
+        *self
+            .points
+            .last()
+            .expect("DispatchPoints is non-empty by construction")
+    }
+
+    fn token_keys(&self) -> impl Iterator<Item = u32> + '_ {
+        self.points.iter().map(|&(token, _)| token)
+    }
+}
+
+fn dispatch_fields(points: &BTreeMap<u32, DispatchPoint>) -> [AxisCurve; DispatchField::COUNT] {
+    std::array::from_fn(|index| {
+        let field = DispatchField::ALL[index];
+        AxisCurve::from_sorted_iter(
+            "num_tokens",
+            points
+                .iter()
+                .map(|(&token, &point)| (token, field.value(point))),
+        )
+    })
+}
+
+impl NormalDispatchSlice {
+    fn new(node_num: u32, by_sms: BTreeMap<u32, BTreeMap<u32, DispatchPoint>>) -> Self {
+        let direct_fields = if node_num == 1 {
+            by_sms.get(&20).map(dispatch_fields)
+        } else {
+            None
+        };
+        let mut fields = std::array::from_fn(|_| Node::branch());
+        let mut summed = Node::branch();
+        for (&sms, by_tokens) in &by_sms {
+            for (&token, &point) in by_tokens {
+                for field in DispatchField::ALL {
+                    fields[field.index()].insert(&[sms, token], field.value(point));
+                }
+                summed.insert(&[sms, token], normal_leaf_sum(&point));
+            }
+        }
+        Self {
+            by_sms: by_sms
+                .into_iter()
+                .map(|(sms, points)| (sms, DispatchPoints::new(points)))
+                .collect(),
+            direct_fields,
+            fields,
+            summed,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -126,6 +272,21 @@ struct MoeKey {
     inter_size: u32,
     moe_tp_size: u32,
     moe_ep_size: u32,
+}
+
+impl MoeKey {
+    fn from_shape(quant: &str, distribution: &str, shape: MoeShapeKey) -> Self {
+        Self {
+            quant: quant.to_string(),
+            distribution: distribution.to_string(),
+            topk: shape.topk,
+            num_experts: shape.num_experts,
+            hidden_size: shape.hidden_size,
+            inter_size: shape.inter_size,
+            moe_tp_size: shape.moe_tp_size,
+            moe_ep_size: shape.moe_ep_size,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -163,14 +324,18 @@ impl WideEpTable {
     /// `perf_db_sources` (Python-supplied). Each perf file falls back to its
     /// primary `data_root/<basename>` when absent from the map. No I/O.
     pub fn with_sources(data_root: PathBuf, perf_db_sources: &PerfDbSources) -> Self {
-        let context_moe_sources =
-            resolve_op_sources(perf_db_sources, "wideep_context_moe_perf.parquet", &data_root);
+        let context_moe_sources = resolve_op_sources(
+            perf_db_sources,
+            "wideep_context_moe_perf.parquet",
+            &data_root,
+        );
         let generation_moe_sources = resolve_op_sources(
             perf_db_sources,
             "wideep_generation_moe_perf.parquet",
             &data_root,
         );
-        let moe_sources = resolve_op_sources(perf_db_sources, "wideep_moe_perf.parquet", &data_root);
+        let moe_sources =
+            resolve_op_sources(perf_db_sources, "wideep_moe_perf.parquet", &data_root);
         let alltoall_sources =
             resolve_op_sources(perf_db_sources, "trtllm_alltoall_perf.parquet", &data_root);
         let deepep_normal_sources = resolve_op_sources(
@@ -287,9 +452,7 @@ impl WideEpTable {
         moe_ep_size: u32,
     ) -> Result<Vec<(u32, f64)>, AicError> {
         let grids = self.load_ctx_or_gen_moe(is_context)?;
-        let key = MoeKey {
-            quant: quant_name.to_string(),
-            distribution: resolve_moe_distribution(grids, quant_name, workload_distribution),
+        let shape = MoeShapeKey {
             topk,
             num_experts,
             hidden_size,
@@ -297,13 +460,18 @@ impl WideEpTable {
             moe_tp_size,
             moe_ep_size,
         };
-        let by_tokens = grids.by_keys.get(&key).filter(|curve| !curve.is_empty()).ok_or_else(|| {
+        let (distribution, by_tokens) =
+            grids
+                .index
+                .resolve_uniform(quant_name, workload_distribution, &shape);
+        let by_tokens = by_tokens.filter(|curve| !curve.is_empty()).ok_or_else(|| {
+            let key = MoeKey::from_shape(quant_name, distribution, shape);
             AicError::PerfDatabase(format!(
                 "WideEP MoE data missing for {key:?} at {}",
                 self.data_root.display()
             ))
         })?;
-        Ok(by_tokens.iter().map(|(&t, &lat)| (t, lat)).collect())
+        Ok(by_tokens.iter().collect())
     }
 
     /// All collected sibling slices of the context/generation WideEP MoE
@@ -321,23 +489,26 @@ impl WideEpTable {
         moe_ep_size: u32,
     ) -> Result<Vec<MoeSiblingSlice>, AicError> {
         let grids = self.load_ctx_or_gen_moe(is_context)?;
-        let dist = resolve_moe_distribution(grids, quant_name, workload_distribution);
+        let (_, by_shape) = grids
+            .index
+            .resolve_uniform_shapes(quant_name, workload_distribution);
         let mut slices = Vec::new();
-        for (key, curve) in &grids.by_keys {
-            if key.quant != quant_name
-                || key.distribution != dist
-                || key.moe_tp_size != moe_tp_size
-                || key.moe_ep_size != moe_ep_size
+        let Some(by_shape) = by_shape else {
+            return Ok(slices);
+        };
+        for (shape, curve) in by_shape {
+            if shape.moe_tp_size != moe_tp_size
+                || shape.moe_ep_size != moe_ep_size
                 || curve.is_empty()
             {
                 continue;
             }
             slices.push(MoeSiblingSlice {
-                topk: key.topk,
-                num_experts: key.num_experts,
-                hidden_size: key.hidden_size,
-                inter_size: key.inter_size,
-                points: curve.iter().map(|(&t, &lat)| (t, lat)).collect(),
+                topk: shape.topk,
+                num_experts: shape.num_experts,
+                hidden_size: shape.hidden_size,
+                inter_size: shape.inter_size,
+                points: curve.iter().collect(),
             });
         }
         Ok(slices)
@@ -347,7 +518,10 @@ impl WideEpTable {
     /// first-seen (file row) order (Python dict insertion order — same
     /// contract as `moe.rs::MoeTable::available_quants`).
     pub fn moe_available_quants(&self, is_context: bool) -> Result<Vec<String>, AicError> {
-        Ok(self.load_ctx_or_gen_moe(is_context)?.quants_in_load_order.clone())
+        Ok(self
+            .load_ctx_or_gen_moe(is_context)?
+            .quants_in_load_order
+            .clone())
     }
 
     fn load_ctx_or_gen_moe(&self, is_context: bool) -> Result<&MoeGrids, AicError> {
@@ -459,7 +633,7 @@ impl WideEpTable {
                 self.data_root.display()
             ))
         })?;
-        query_token_curve(by_tokens, num_tokens as f64, &|t| t)
+        by_tokens.query(num_tokens as f64, &|t| t)
     }
 
     /// Collected `(num_tokens, latency)` points of one resolved alltoall
@@ -503,7 +677,7 @@ impl WideEpTable {
                 self.data_root.display()
             )));
         }
-        Ok(by_tokens.iter().map(|(&t, &lat)| (t, lat)).collect())
+        Ok(by_tokens.iter().collect())
     }
 
     /// DeepEP normal-mode dispatch point.
@@ -511,9 +685,9 @@ impl WideEpTable {
     /// Mirrors Python `_query_wideep_deepep_normal_table` (silicon path):
     /// `node_num == 1 && sms == 20` resolves the sm=20 slice as a plain 1-D
     /// token curve; anything else resolves a 2-axis `(sms, num_tokens)` Grid
-    /// where an off-grid `sms` snaps to the nearest collected value (the SOL
-    /// is the linear token proxy, constant in sms — no data supports an sms
-    /// scaling story yet).
+    /// where past-range coordinates hold via the joint-log kNN util transfer
+    /// (the SOL is the linear token proxy, constant in sms — no data supports
+    /// an sms scaling story yet).
     pub fn query_deepep_normal(
         &self,
         node_num: u32,
@@ -530,7 +704,7 @@ impl WideEpTable {
             num_topk,
             num_experts,
         };
-        let by_sms = grids.by_keys.get(&key).ok_or_else(|| {
+        let slice = grids.by_keys.get(&key).ok_or_else(|| {
             AicError::PerfDatabase(format!(
                 "dispatch data missing for {key:?} at {}",
                 self.data_root.display()
@@ -540,35 +714,66 @@ impl WideEpTable {
             // Python: only sm=20 is collected for node_num==1 today; the
             // sms bucket is indexed directly and the token curve rides the
             // 1-axis engine.
-            let by_tokens = by_sms.get(&20).ok_or_else(|| {
+            let by_tokens = slice.by_sms.get(&20).ok_or_else(|| {
                 AicError::PerfDatabase(format!(
                     "dispatch data missing for {key:?} (sms=20) at {}",
                     self.data_root.display()
                 ))
             })?;
-            if let Some(point) = by_tokens.get(&num_tokens) {
-                return Ok(*point);
+            if let Some(point) = by_tokens.get(num_tokens) {
+                return Ok(point);
             }
+            let fields = slice
+                .direct_fields
+                .as_ref()
+                .expect("node_num=1 sms=20 fields are built with the slice");
             return Ok(DispatchPoint {
-                dispatch_transmit_us: dispatch_field(by_tokens, |p| p.dispatch_transmit_us, num_tokens)?,
-                dispatch_notify_us: dispatch_field(by_tokens, |p| p.dispatch_notify_us, num_tokens)?,
-                combine_transmit_us: dispatch_field(by_tokens, |p| p.combine_transmit_us, num_tokens)?,
-                combine_notify_us: dispatch_field(by_tokens, |p| p.combine_notify_us, num_tokens)?,
-                combine_avg_t_us: dispatch_field(by_tokens, |p| p.combine_avg_t_us, num_tokens)?,
-                dispatch_avg_t_us: dispatch_field(by_tokens, |p| p.dispatch_avg_t_us, num_tokens)?,
+                dispatch_transmit_us: dispatch_field(
+                    by_tokens,
+                    fields,
+                    DispatchField::DispatchTransmit,
+                    num_tokens,
+                )?,
+                dispatch_notify_us: dispatch_field(
+                    by_tokens,
+                    fields,
+                    DispatchField::DispatchNotify,
+                    num_tokens,
+                )?,
+                combine_transmit_us: dispatch_field(
+                    by_tokens,
+                    fields,
+                    DispatchField::CombineTransmit,
+                    num_tokens,
+                )?,
+                combine_notify_us: dispatch_field(
+                    by_tokens,
+                    fields,
+                    DispatchField::CombineNotify,
+                    num_tokens,
+                )?,
+                combine_avg_t_us: dispatch_field(
+                    by_tokens,
+                    fields,
+                    DispatchField::CombineAverage,
+                    num_tokens,
+                )?,
+                dispatch_avg_t_us: dispatch_field(
+                    by_tokens,
+                    fields,
+                    DispatchField::DispatchAverage,
+                    num_tokens,
+                )?,
             });
         }
-        if let Some(point) = by_sms.get(&sms).and_then(|slice| slice.get(&num_tokens)) {
-            return Ok(*point);
+        if let Some(point) = slice
+            .by_sms
+            .get(&sms)
+            .and_then(|curve| curve.get(num_tokens))
+        {
+            return Ok(point);
         }
-        Ok(DispatchPoint {
-            dispatch_transmit_us: dispatch_field_2d(by_sms, |p| p.dispatch_transmit_us, sms, num_tokens)?,
-            dispatch_notify_us: dispatch_field_2d(by_sms, |p| p.dispatch_notify_us, sms, num_tokens)?,
-            combine_transmit_us: dispatch_field_2d(by_sms, |p| p.combine_transmit_us, sms, num_tokens)?,
-            combine_notify_us: dispatch_field_2d(by_sms, |p| p.combine_notify_us, sms, num_tokens)?,
-            combine_avg_t_us: dispatch_field_2d(by_sms, |p| p.combine_avg_t_us, sms, num_tokens)?,
-            dispatch_avg_t_us: dispatch_field_2d(by_sms, |p| p.dispatch_avg_t_us, sms, num_tokens)?,
-        })
+        dispatch_point_2d(slice, sms, num_tokens)
     }
 
     /// DeepEP low-latency dispatch point.
@@ -581,7 +786,15 @@ impl WideEpTable {
         num_experts: u32,
     ) -> Result<DispatchPoint, AicError> {
         let grids = self.load_deepep_ll()?;
-        dispatch_lookup(grids, node_num, hidden_size, num_tokens, num_topk, num_experts, &self.data_root)
+        dispatch_lookup(
+            grids,
+            node_num,
+            hidden_size,
+            num_tokens,
+            num_topk,
+            num_experts,
+            &self.data_root,
+        )
     }
 
     fn load_context_moe(&self) -> Result<&MoeGrids, AicError> {
@@ -622,24 +835,6 @@ impl WideEpTable {
     }
 }
 
-/// Mirrors Python's `wl = workload if workload in moe_data[quant] else
-/// "uniform"` on a wideep MoE grid.
-fn resolve_moe_distribution(
-    grids: &MoeGrids,
-    quant_name: &str,
-    workload_distribution: &str,
-) -> String {
-    let requested_exists = grids
-        .by_keys
-        .keys()
-        .any(|k| k.quant == quant_name && k.distribution == workload_distribution);
-    if requested_exists {
-        workload_distribution.to_string()
-    } else {
-        "uniform".to_string()
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn query_moe(
     grids: &MoeGrids,
@@ -657,10 +852,7 @@ fn query_moe(
     sol: &dyn Fn(f64) -> f64,
 ) -> Result<f64, AicError> {
     let quant_name = quant.name();
-    let distribution = resolve_moe_distribution(grids, quant_name, workload_distribution);
-    let key = MoeKey {
-        quant: quant_name.to_string(),
-        distribution,
+    let shape = MoeShapeKey {
         topk,
         num_experts,
         hidden_size,
@@ -668,19 +860,29 @@ fn query_moe(
         moe_tp_size,
         moe_ep_size,
     };
-    let by_tokens = grids
-        .by_keys
-        .get(&key)
-        .ok_or_else(|| AicError::PerfDatabase(format!("MoE data missing for {key:?} at {}", data_root.display())))?;
+    let (distribution, by_tokens) =
+        grids
+            .index
+            .resolve_uniform(quant_name, workload_distribution, &shape);
+    let by_tokens = by_tokens.ok_or_else(|| {
+        let key = MoeKey::from_shape(quant_name, distribution, shape);
+        AicError::PerfDatabase(format!(
+            "MoE data missing for {key:?} at {}",
+            data_root.display()
+        ))
+    })?;
     if by_tokens.is_empty() {
-        return Err(AicError::PerfDatabase("MoE table has no token points".to_string()));
+        return Err(AicError::PerfDatabase(
+            "MoE table has no token points".to_string(),
+        ));
     }
     // Python's `_resolve_tokens` singleton-underflow guard applies only to
     // the paths that route through it (sglang deepep context/generation MoE
     // compute); `_query_alltoall_table` / `_query_compute_table` query the
     // engine directly and let a singleton curve util-hold instead.
     if guard_singleton_underflow {
-        if let Some(only) = singleton_underflow(by_tokens, num_tokens) {
+        if let Some(only) = by_tokens.singleton_underflow(num_tokens) {
+            let key = MoeKey::from_shape(quant_name, distribution, shape);
             return Err(AicError::PerfDatabase(format!(
                 "MoE silicon token underflow has only one measured point; cannot infer \
                  low-token latency from a singleton. num_tokens={num_tokens}, \
@@ -688,7 +890,7 @@ fn query_moe(
             )));
         }
     }
-    query_token_curve(by_tokens, num_tokens as f64, sol)
+    by_tokens.query(num_tokens as f64, sol)
 }
 
 /// Resolve one `DispatchPoint` field's token curve on the engine, with the
@@ -698,102 +900,114 @@ fn query_moe(
 /// anchor" miss. Under the linear proxy this is numerically identical to
 /// Python's util-hold on the SUMMED curve (`q/b * 0 = 0`).
 fn dispatch_field(
-    by_tokens: &BTreeMap<u32, DispatchPoint>,
-    field: fn(&DispatchPoint) -> f64,
+    by_tokens: &DispatchPoints,
+    fields: &[AxisCurve; DispatchField::COUNT],
+    field: DispatchField,
     num_tokens: u32,
 ) -> Result<f64, AicError> {
-    let (&first, _) = by_tokens.iter().next().expect("caller checked non-empty");
-    let (&last, _) = by_tokens.iter().next_back().expect("caller checked non-empty");
+    let (first, first_point) = by_tokens.first();
+    let (last, last_point) = by_tokens.last();
     if num_tokens < first || num_tokens > last {
-        let anchor = if num_tokens < first { &by_tokens[&first] } else { &by_tokens[&last] };
-        if field(anchor) == 0.0 {
+        let anchor = if num_tokens < first {
+            first_point
+        } else {
+            last_point
+        };
+        if field.value(anchor) == 0.0 {
             return Ok(0.0);
         }
     }
-    let curve: BTreeMap<u32, f64> = by_tokens.iter().map(|(&t, p)| (t, field(p))).collect();
-    query_token_curve(&curve, num_tokens as f64, &|t| t)
+    fields[field.index()].query(num_tokens as f64, &|t| t)
 }
 
-/// Resolve one `DispatchPoint` field on the DeepEP-normal 2-axis
-/// `(sms, num_tokens)` grid via the shared engine (Python's
-/// `OpInterpConfig(axes=("sms","num_tokens"), resolver=Grid(),
-/// sol_fn=lambda _sm, t: float(t))`): in-range coordinates bracket+blend, an
-/// off-grid `sms` snaps to the nearest collected value, and beyond-range
-/// tokens util-hold on the linear proxy. The zero-boundary convention (see
-/// [`dispatch_field`]) is applied via the hold anchor: when the query resolves
-/// through `grid_hold` and the anchor's field is 0, the field contributes 0
-/// instead of a spurious "no positive-util anchor" miss — numerically
-/// identical to Python's util-hold on the SUMMED curve.
-fn dispatch_field_2d(
-    by_sms: &BTreeMap<u32, BTreeMap<u32, DispatchPoint>>,
-    field: fn(&DispatchPoint) -> f64,
+/// The four components Python's normal-mode loader sums into its table leaf.
+fn normal_leaf_sum(p: &DispatchPoint) -> f64 {
+    p.dispatch_transmit_us + p.dispatch_notify_us + p.combine_transmit_us + p.combine_notify_us
+}
+
+/// Resolve a DeepEP-normal `DispatchPoint` on the 2-axis `(sms, num_tokens)`
+/// grid via the shared engine (Python's `OpInterpConfig(axes=("sms",
+/// "num_tokens"), resolver=Grid(), sol_fn=lambda _sm, t: float(t))`).
+///
+/// Python resolves the SUMMED curve (its loader stores the four-component
+/// [`normal_leaf_sum`] as the leaf); this port needs the components. In-range
+/// resolution (bracket+blend / single-survivor) is linear in the leaf, so
+/// resolving each field separately (on the slice's precomputed field nodes)
+/// sums to Python's total exactly. The hold path blends utils (nonlinear in
+/// the leaf), so there the total is resolved on the precomputed summed node —
+/// engine-exact parity — and split into components by the hold anchors'
+/// weighted field shares. Shares sum to 1, and a field that is 0 at every
+/// anchor (e.g. the LL-only fields) stays 0, preserving the zero-boundary
+/// convention the per-field path used to special-case.
+fn dispatch_point_2d(
+    slice: &NormalDispatchSlice,
     sms: u32,
     num_tokens: u32,
-) -> Result<f64, AicError> {
-    if let Some(anchor) = normal_hold_anchor(by_sms, sms, num_tokens) {
-        if field(anchor) == 0.0 {
-            return Ok(0.0);
-        }
-    }
-    let mut node = Node::branch();
-    for (&sm, by_tokens) in by_sms {
-        for (&t, point) in by_tokens {
-            node.insert(&[sm, t], field(point));
-        }
-    }
+) -> Result<DispatchPoint, AicError> {
     let sol = |c: &[f64]| c[1];
     let cfg = OpInterpConfig::grid(&["sms", "num_tokens"], &sol);
-    perf_interp::query(&cfg, &node, &[sms as f64, num_tokens as f64])
+    let coords = [sms as f64, num_tokens as f64];
+
+    if !normal_hold_query(&slice.by_sms, sms, num_tokens) {
+        let field_2d = |field: DispatchField| -> Result<f64, AicError> {
+            perf_interp::query(&cfg, &slice.fields[field.index()], &coords)
+        };
+        return Ok(DispatchPoint {
+            dispatch_transmit_us: field_2d(DispatchField::DispatchTransmit)?,
+            dispatch_notify_us: field_2d(DispatchField::DispatchNotify)?,
+            combine_transmit_us: field_2d(DispatchField::CombineTransmit)?,
+            combine_notify_us: field_2d(DispatchField::CombineNotify)?,
+            combine_avg_t_us: field_2d(DispatchField::CombineAverage)?,
+            dispatch_avg_t_us: field_2d(DispatchField::DispatchAverage)?,
+        });
+    }
+
+    let total = perf_interp::query(&cfg, &slice.summed, &coords)?;
+    let anchors = perf_interp::hold_anchor_weights(&cfg, &slice.summed, &coords, 4)?;
+    let wsum: f64 = anchors.iter().map(|a| a.weight).sum();
+    let share = |field: DispatchField| -> f64 {
+        anchors
+            .iter()
+            .map(|a| {
+                let point = slice.by_sms[&a.coords[0]]
+                    .get(a.coords[1])
+                    .expect("anchor coords come from the summed node");
+                a.weight * (field.value(point) / a.latency)
+            })
+            .sum::<f64>()
+            / wsum
+    };
+    Ok(DispatchPoint {
+        dispatch_transmit_us: total * share(DispatchField::DispatchTransmit),
+        dispatch_notify_us: total * share(DispatchField::DispatchNotify),
+        combine_transmit_us: total * share(DispatchField::CombineTransmit),
+        combine_notify_us: total * share(DispatchField::CombineNotify),
+        combine_avg_t_us: total * share(DispatchField::CombineAverage),
+        dispatch_avg_t_us: total * share(DispatchField::DispatchAverage),
+    })
 }
 
-/// Predict the engine's `grid_hold` anchor for a `(sms, num_tokens)` query on
-/// a DeepEP-normal slice; `None` when the query resolves in-range (exact hit,
-/// token lerp, sms lerp, or single-survivor). Mirrors `grid_hold`'s
-/// snap-then-tail walk with `k_tail = 1`: sms snaps to the nearest collected
-/// key (tie -> smaller), tokens anchor at the boundary key when beyond the
-/// slice's range and at the nearest key otherwise.
-fn normal_hold_anchor<'a>(
-    by_sms: &'a BTreeMap<u32, BTreeMap<u32, DispatchPoint>>,
+/// True when a `(sms, num_tokens)` query on a DeepEP-normal slice resolves
+/// through the engine's hold path (an exact hit, token lerp, sms lerp, or
+/// single-survivor is in-range -> false). Mirrors `grid_interior`'s range
+/// decisions for this 2-axis grid, which depend only on the key structure.
+fn normal_hold_query(
+    by_sms: &BTreeMap<u32, DispatchPoints>,
     sms: u32,
     num_tokens: u32,
-) -> Option<&'a DispatchPoint> {
+) -> bool {
     if by_sms.is_empty() {
-        return None;
+        return false;
     }
-    let covered = |slice: &BTreeMap<u32, DispatchPoint>| -> bool {
-        let (&first, _) = slice.iter().next().expect("loader never stores empty slices");
-        let (&last, _) = slice.iter().next_back().expect("loader never stores empty slices");
+    let covered = |slice: &DispatchPoints| -> bool {
+        let (first, _) = slice.first();
+        let (last, _) = slice.last();
         first <= num_tokens && num_tokens <= last
-    };
-    let nearest = |keys: &mut dyn Iterator<Item = u32>, c: u32| -> u32 {
-        keys.min_by(|a, b| {
-            let da = (f64::from(*a) - f64::from(c)).abs();
-            let db = (f64::from(*b) - f64::from(c)).abs();
-            da.total_cmp(&db)
-        })
-        .expect("non-empty")
-    };
-    let anchor_in = |slice: &'a BTreeMap<u32, DispatchPoint>| -> &'a DispatchPoint {
-        let (&first, _) = slice.iter().next().expect("non-empty");
-        let (&last, _) = slice.iter().next_back().expect("non-empty");
-        if num_tokens > last {
-            &slice[&last]
-        } else if num_tokens < first {
-            &slice[&first]
-        } else {
-            // tokens in range but an OUTER (sms) axis was snapped -> the
-            // engine holds at the NEAREST token key, not a lerp.
-            let key = nearest(&mut slice.keys().copied(), num_tokens);
-            &slice[&key]
-        }
     };
     if let Some(slice) = by_sms.get(&sms) {
         // Exact sms key collapses that level; tokens in range resolve
         // in-slice (exact/lerp) -> no hold.
-        if covered(slice) {
-            return None;
-        }
-        return Some(anchor_in(slice));
+        return !covered(slice);
     }
     let (&min_sms, _) = by_sms.iter().next().expect("non-empty");
     let (&max_sms, _) = by_sms.iter().next_back().expect("non-empty");
@@ -803,11 +1017,10 @@ fn normal_hold_anchor<'a>(
         let (_, lo_slice) = by_sms.range(..sms).next_back().expect("bracketed");
         let (_, hi_slice) = by_sms.range(sms..).next().expect("bracketed");
         if covered(lo_slice) || covered(hi_slice) {
-            return None;
+            return false;
         }
     }
-    let snapped = nearest(&mut by_sms.keys().copied(), sms);
-    Some(anchor_in(&by_sms[&snapped]))
+    true
 }
 
 fn dispatch_lookup(
@@ -826,24 +1039,51 @@ fn dispatch_lookup(
         num_experts,
     };
     let by_tokens = grids.by_keys.get(&key).ok_or_else(|| {
-        AicError::PerfDatabase(format!("dispatch data missing for {key:?} at {}", data_root.display()))
-    })?;
-    if let Some(point) = by_tokens.get(&num_tokens) {
-        return Ok(*point);
-    }
-    if by_tokens.is_empty() {
-        return Err(AicError::PerfDatabase(format!(
-            "dispatch data has no token points for {key:?} at {}",
+        AicError::PerfDatabase(format!(
+            "dispatch data missing for {key:?} at {}",
             data_root.display()
-        )));
+        ))
+    })?;
+    if let Some(point) = by_tokens.points.get(num_tokens) {
+        return Ok(point);
     }
     Ok(DispatchPoint {
-        dispatch_transmit_us: dispatch_field(by_tokens, |p| p.dispatch_transmit_us, num_tokens)?,
-        dispatch_notify_us: dispatch_field(by_tokens, |p| p.dispatch_notify_us, num_tokens)?,
-        combine_transmit_us: dispatch_field(by_tokens, |p| p.combine_transmit_us, num_tokens)?,
-        combine_notify_us: dispatch_field(by_tokens, |p| p.combine_notify_us, num_tokens)?,
-        combine_avg_t_us: dispatch_field(by_tokens, |p| p.combine_avg_t_us, num_tokens)?,
-        dispatch_avg_t_us: dispatch_field(by_tokens, |p| p.dispatch_avg_t_us, num_tokens)?,
+        dispatch_transmit_us: dispatch_field(
+            &by_tokens.points,
+            &by_tokens.fields,
+            DispatchField::DispatchTransmit,
+            num_tokens,
+        )?,
+        dispatch_notify_us: dispatch_field(
+            &by_tokens.points,
+            &by_tokens.fields,
+            DispatchField::DispatchNotify,
+            num_tokens,
+        )?,
+        combine_transmit_us: dispatch_field(
+            &by_tokens.points,
+            &by_tokens.fields,
+            DispatchField::CombineTransmit,
+            num_tokens,
+        )?,
+        combine_notify_us: dispatch_field(
+            &by_tokens.points,
+            &by_tokens.fields,
+            DispatchField::CombineNotify,
+            num_tokens,
+        )?,
+        combine_avg_t_us: dispatch_field(
+            &by_tokens.points,
+            &by_tokens.fields,
+            DispatchField::CombineAverage,
+            num_tokens,
+        )?,
+        dispatch_avg_t_us: dispatch_field(
+            &by_tokens.points,
+            &by_tokens.fields,
+            DispatchField::DispatchAverage,
+            num_tokens,
+        )?,
     })
 }
 
@@ -856,7 +1096,7 @@ fn dispatch_lookup(
 /// returned only when no source yields rows. Reused for the
 /// context/generation/wideep-moe parquets (alltoall has its own loader).
 fn load_moe_parquet(sources: &[PerfSource]) -> Result<MoeGrids, AicError> {
-    let mut by_keys: BTreeMap<MoeKey, BTreeMap<u32, f64>> = BTreeMap::new();
+    let mut index: MoeIndex<MoeShapeKey, BTreeMap<u32, f64>> = MoeIndex::default();
     let mut quants_in_load_order: Vec<String> = Vec::new();
     let mut any_source = false;
     for source in sources {
@@ -885,9 +1125,9 @@ fn load_moe_parquet(sources: &[PerfSource]) -> Result<MoeGrids, AicError> {
             if !kernel_source_ok(source.kernel_sources(), ks_col, &row)? {
                 continue;
             }
-            let key = MoeKey {
-                quant: row.str_owned(moe_dtype_col)?,
-                distribution: row.str_owned(distribution_col)?,
+            let quant = row.str_owned(moe_dtype_col)?;
+            let distribution = row.str_owned(distribution_col)?;
+            let shape = MoeShapeKey {
                 topk: row.u32(topk_col)?,
                 num_experts: row.u32(num_experts_col)?,
                 hidden_size: row.u32(hidden_size_col)?,
@@ -896,27 +1136,32 @@ fn load_moe_parquet(sources: &[PerfSource]) -> Result<MoeGrids, AicError> {
                 moe_ep_size: row.u32(moe_ep_size_col)?,
             };
             // First-seen (file row) quant order (Python dict insertion order).
-            if !quants_in_load_order.iter().any(|q| q == &key.quant) {
-                quants_in_load_order.push(key.quant.clone());
+            if !quants_in_load_order.iter().any(|q| q == &quant) {
+                quants_in_load_order.push(quant.clone());
             }
             // First-wins parity with Python `load_wideep_*_moe_data`, which now
             // guards with the standard skip-on-key-conflict idiom
             // (shared-layer contract, design §6.1).
-            by_keys
-                .entry(key)
-                .or_default()
+            index
+                .entry(quant, distribution, shape)
                 .entry(row.u32(num_tokens_col)?)
                 .or_insert(row.f64(latency_col)?);
         }
     }
-    if !any_source || by_keys.is_empty() {
+    if !any_source || index.is_empty() {
         return Err(AicError::PerfDatabase(format!(
             "no MoE-shape rows loaded from {} source(s) (first: {})",
             sources.len(),
-            sources.first().map(|s| s.path().display().to_string()).unwrap_or_default()
+            sources
+                .first()
+                .map(|s| s.path().display().to_string())
+                .unwrap_or_default()
         )));
     }
-    Ok(MoeGrids { by_keys, quants_in_load_order })
+    Ok(MoeGrids {
+        index: index.map_values(|curve| AxisCurve::from_map("num_tokens", curve)),
+        quants_in_load_order,
+    })
 }
 
 /// Auto-select the TRT-LLM All2All kernel. Verbatim port of Python
@@ -945,7 +1190,9 @@ pub(crate) fn select_alltoall_kernel(
         }
     }
     let supports_mnnvl = spec.gpu.sm_version.unwrap_or(0) >= 100;
-    let is_wideep = moe_backend.map(|b| b.to_uppercase() == "WIDEEP").unwrap_or(false);
+    let is_wideep = moe_backend
+        .map(|b| b.to_uppercase() == "WIDEEP")
+        .unwrap_or(false);
     if is_wideep {
         if supports_mnnvl {
             return "NVLinkTwoSided";
@@ -1030,10 +1277,18 @@ fn load_alltoall_parquet(sources: &[PerfSource]) -> Result<AlltoallGrids, AicErr
         return Err(AicError::PerfDatabase(format!(
             "no TRT-LLM alltoall rows loaded from {} source(s) (first: {})",
             sources.len(),
-            sources.first().map(|s| s.path().display().to_string()).unwrap_or_default()
+            sources
+                .first()
+                .map(|s| s.path().display().to_string())
+                .unwrap_or_default()
         )));
     }
-    Ok(AlltoallGrids { by_keys })
+    Ok(AlltoallGrids {
+        by_keys: by_keys
+            .into_iter()
+            .map(|(key, curve)| (key, AxisCurve::from_map("num_tokens", curve)))
+            .collect(),
+    })
 }
 
 /// Load the DeepEP-normal dispatch table from an ordered source list. Missing
@@ -1088,7 +1343,9 @@ fn load_deepep_normal_parquet(sources: &[PerfSource]) -> Result<NormalDispatchGr
                 .or_default()
                 .entry(row.u32(num_token_col)?)
                 .or_insert(DispatchPoint {
-                    dispatch_transmit_us: row.f64_optional(dispatch_transmit_us_col)?.unwrap_or(0.0),
+                    dispatch_transmit_us: row
+                        .f64_optional(dispatch_transmit_us_col)?
+                        .unwrap_or(0.0),
                     dispatch_notify_us: row.f64_optional(dispatch_notify_us_col)?.unwrap_or(0.0),
                     combine_transmit_us: row.f64_optional(combine_transmit_us_col)?.unwrap_or(0.0),
                     combine_notify_us: row.f64_optional(combine_notify_us_col)?.unwrap_or(0.0),
@@ -1101,10 +1358,21 @@ fn load_deepep_normal_parquet(sources: &[PerfSource]) -> Result<NormalDispatchGr
         return Err(AicError::PerfDatabase(format!(
             "no DeepEP-normal rows loaded from {} source(s) (first: {})",
             sources.len(),
-            sources.first().map(|s| s.path().display().to_string()).unwrap_or_default()
+            sources
+                .first()
+                .map(|s| s.path().display().to_string())
+                .unwrap_or_default()
         )));
     }
-    Ok(NormalDispatchGrids { by_keys })
+    Ok(NormalDispatchGrids {
+        by_keys: by_keys
+            .into_iter()
+            .map(|(key, by_sms)| {
+                let slice = NormalDispatchSlice::new(key.node_num, by_sms);
+                (key, slice)
+            })
+            .collect(),
+    })
 }
 
 /// Load the DeepEP low-latency dispatch table from an ordered source list.
@@ -1142,26 +1410,36 @@ fn load_deepep_ll_parquet(sources: &[PerfSource]) -> Result<DispatchGrids, AicEr
                 num_experts: row.u32(num_experts_col)?,
             };
             // First-wins on the full coordinate (Python skip-on-conflict).
-            by_keys.entry(key).or_default().entry(row.u32(num_token_col)?).or_insert(
-                DispatchPoint {
+            by_keys
+                .entry(key)
+                .or_default()
+                .entry(row.u32(num_token_col)?)
+                .or_insert(DispatchPoint {
                     dispatch_transmit_us: 0.0,
                     dispatch_notify_us: 0.0,
                     combine_transmit_us: 0.0,
                     combine_notify_us: 0.0,
                     combine_avg_t_us: row.f64_optional(combine_avg_t_us_col)?.unwrap_or(0.0),
                     dispatch_avg_t_us: row.f64_optional(dispatch_avg_t_us_col)?.unwrap_or(0.0),
-                },
-            );
+                });
         }
     }
     if !any_source || by_keys.is_empty() {
         return Err(AicError::PerfDatabase(format!(
             "no DeepEP-LL rows loaded from {} source(s) (first: {})",
             sources.len(),
-            sources.first().map(|s| s.path().display().to_string()).unwrap_or_default()
+            sources
+                .first()
+                .map(|s| s.path().display().to_string())
+                .unwrap_or_default()
         )));
     }
-    Ok(DispatchGrids { by_keys })
+    Ok(DispatchGrids {
+        by_keys: by_keys
+            .into_iter()
+            .map(|(key, curve)| (key, DispatchCurve::new(curve)))
+            .collect(),
+    })
 }
 
 fn clone_err(err: &AicError) -> AicError {
@@ -1250,43 +1528,89 @@ mod tests {
                 .expect("writer");
         let mut rg = writer.next_row_group().expect("row group");
         let int_cols: [Vec<i64>; 6] = [
-            rows.iter().map(|r| r.0).collect(),                // node_num
-            rows.iter().map(|_| 7168).collect(),               // hidden_size
-            rows.iter().map(|r| r.2).collect(),                // num_token
-            rows.iter().map(|_| 8).collect(),                  // num_topk
-            rows.iter().map(|_| 256).collect(),                // num_experts
-            rows.iter().map(|r| r.1).collect(),                // dispatch_sms
+            rows.iter().map(|r| r.0).collect(),  // node_num
+            rows.iter().map(|_| 7168).collect(), // hidden_size
+            rows.iter().map(|r| r.2).collect(),  // num_token
+            rows.iter().map(|_| 8).collect(),    // num_topk
+            rows.iter().map(|_| 256).collect(),  // num_experts
+            rows.iter().map(|r| r.1).collect(),  // dispatch_sms
         ];
         for values in &int_cols {
             let mut col = rg.next_column().expect("next col").expect("int col");
-            col.typed::<Int64Type>().write_batch(values, None, None).expect("write ints");
+            col.typed::<Int64Type>()
+                .write_batch(values, None, None)
+                .expect("write ints");
             col.close().expect("close col");
         }
         let f64_cols: [Vec<f64>; 4] = [
-            rows.iter().map(|r| r.3).collect(),                // dispatch_transmit_us
-            rows.iter().map(|_| 1.0).collect(),                // dispatch_notify_us
-            rows.iter().map(|_| 2.0).collect(),                // combine_transmit_us
-            rows.iter().map(|_| 0.0).collect(),                // combine_notify_us (zero-boundary)
+            rows.iter().map(|r| r.3).collect(), // dispatch_transmit_us
+            rows.iter().map(|_| 1.0).collect(), // dispatch_notify_us
+            rows.iter().map(|_| 2.0).collect(), // combine_transmit_us
+            rows.iter().map(|_| 0.0).collect(), // combine_notify_us (zero-boundary)
         ];
         for values in &f64_cols {
             let mut col = rg.next_column().expect("next col").expect("f64 col");
-            col.typed::<DoubleType>().write_batch(values, None, None).expect("write f64");
+            col.typed::<DoubleType>()
+                .write_batch(values, None, None)
+                .expect("write f64");
             col.close().expect("close col");
         }
         rg.close().expect("close row group");
         writer.close().expect("close writer");
     }
 
+    /// Reference for the multi-axis hold: kNN(4) utils in joint log2 space on
+    /// the SUMMED leaves (mirrors Python's summed-curve resolve), then the
+    /// requested field as the anchors' weighted share of the total.
+    fn knn_hold_field(
+        leaves: &[((u32, u32), f64, f64)], // ((sms, tokens), summed latency, field value)
+        sms: u32,
+        num_tokens: u32,
+    ) -> f64 {
+        let q = [(sms as f64).log2(), (num_tokens as f64).log2()];
+        let mut ranked: Vec<(f64, usize)> = leaves
+            .iter()
+            .enumerate()
+            .map(|(i, ((sm, t), _, _))| {
+                let d = [(*sm as f64).log2() - q[0], (*t as f64).log2() - q[1]];
+                ((d[0] * d[0] + d[1] * d[1]).sqrt(), i)
+            })
+            .collect();
+        ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // Tapered modified-Shepard weights, matching the engine: support
+        // radius R at the 5th distance (R = inf -> plain 1/d^2).
+        let support_r = if ranked.len() > 4 { ranked[4].0 } else { f64::INFINITY };
+        let picked: Vec<(f64, usize)> = ranked.into_iter().take(4).collect();
+        let w = |d: f64| {
+            if support_r.is_infinite() {
+                1.0 / (d * d + 1e-12)
+            } else {
+                let t = (support_r - d).max(0.0) / (support_r * d + 1e-12);
+                t * t
+            }
+        };
+        let wsum: f64 = picked.iter().map(|&(d, _)| w(d)).sum();
+        let util: f64 = picked
+            .iter()
+            .map(|&(d, i)| w(d) * (leaves[i].0 .1 as f64 / leaves[i].1))
+            .sum::<f64>()
+            / wsum;
+        let total = num_tokens as f64 / util;
+        let share: f64 = picked
+            .iter()
+            .map(|&(d, i)| w(d) * (leaves[i].2 / leaves[i].1))
+            .sum::<f64>()
+            / wsum;
+        total * share
+    }
+
     /// Item 3: the DeepEP-normal table is keyed by `dispatch_sms` (Python
-    /// `[node][hidden][topk][experts][dispatch_sms][num_token]`) and queried
-    /// with nearest-snap sms semantics. The old Rust `DispatchKey` lacked the
-    /// sms level and last-wins-collapsed the rows, answering the LAST sms row
-    /// for every query. Python oracle (verified against
-    /// `perf_interp.query(OpInterpConfig(axes=("sms","num_tokens"),
-    /// resolver=Grid(), sol_fn=lambda _sm, t: float(t)), data, sms, 64)` on
-    /// the same synthetic dict): sms=16 -> 100 (own row), sms=32 -> 500 (own
-    /// row), sms=24 -> 300 (sms lerp), sms=12 -> 100 (snap below), sms=40 ->
-    /// 500 (snap above).
+    /// `[node][hidden][topk][experts][dispatch_sms][num_token]`). The old
+    /// Rust `DispatchKey` lacked the sms level and last-wins-collapsed the
+    /// rows, answering the LAST sms row for every query. Semantics on the
+    /// synthetic dict: sms=16 -> 100 (own row), sms=32 -> 500 (own row),
+    /// sms=24 -> 300 (sms lerp); sms=12/40 are past the sms range ->
+    /// util-hold via the joint-log kNN blend of both measured leaves.
     #[test]
     fn deepep_normal_keys_by_dispatch_sms_and_snaps_off_grid() {
         let tmp = tempfile::tempdir().expect("tmpdir");
@@ -1304,26 +1628,37 @@ mod tests {
         // returned 500 for both).
         assert_eq!(q(16).dispatch_transmit_us, 100.0);
         assert_eq!(q(32).dispatch_transmit_us, 500.0);
-        // Off-grid sms: interior lerp / nearest snap (Python Grid semantics).
+        // Off-grid but bracketed sms: interior lerp (Python Grid semantics).
         assert_eq!(q(24).dispatch_transmit_us, 300.0);
-        assert_eq!(q(12).dispatch_transmit_us, 100.0);
-        assert_eq!(q(40).dispatch_transmit_us, 500.0);
-        // The LL-only fields stay 0 through every path (zero-boundary
-        // convention on the snap/hold paths, plain lerp of zeros in range).
+        // Past the sms range: kNN util-hold on the summed leaves (fixture
+        // sums are 103 and 503: transmit + notify 1.0 + combine 2.0).
+        let leaves = [((16u32, 64u32), 103.0, 100.0), ((32, 64), 503.0, 500.0)];
+        let expect = |sms: u32| knn_hold_field(&leaves, sms, 64);
+        assert!((q(12).dispatch_transmit_us - expect(12)).abs() < 1e-9);
+        assert!((q(40).dispatch_transmit_us - expect(40)).abs() < 1e-9);
+        // The LL-only fields stay 0 through every path (zero anchor share on
+        // the hold path, plain lerp of zeros in range).
         assert_eq!(q(24).combine_avg_t_us, 0.0);
         assert_eq!(q(12).combine_avg_t_us, 0.0);
-        // combine_notify_us is measured-zero in this fixture: snap/hold paths
+        // combine_notify_us is measured-zero in this fixture: the hold path
         // must yield 0, not a "no positive-util anchor" miss.
         assert_eq!(q(12).combine_notify_us, 0.0);
+        let key = DispatchKey {
+            node_num: 2,
+            hidden_size: 7168,
+            num_topk: 8,
+            num_experts: 256,
+        };
+        assert!(table.load_deepep_normal().unwrap().by_keys[&key]
+            .direct_fields
+            .is_none());
     }
 
-    /// Item 3 (token axis under the sms grid): beyond-range tokens util-hold
-    /// on the linear proxy inside the resolved sms slice; an off-grid sms
-    /// with in-range tokens holds at the NEAREST token key (not a lerp),
-    /// mirroring `_grid_hold`'s outer-axis-snapped tail. Python oracle from
-    /// the same `perf_interp` config on `{16: {64: 100, 128: 200}}`:
-    /// (sms=16, nt=256) -> 400 (= 200 * 256/128); (sms=12, nt=96) -> 150
-    /// (= 100 * 96/64; tie |96-64| == |96-128| keeps the smaller key).
+    /// Item 3 (token axis under the sms grid): beyond-range tokens and
+    /// off-range sms both util-hold via the joint-log kNN blend of the
+    /// measured leaves (the engine no longer snaps to a single nearest path
+    /// — that was discontinuous at bracket midpoints). Expectations come from
+    /// the same kNN reference the engine and Python's `_grid_hold` implement.
     #[test]
     fn deepep_normal_token_hold_and_outer_snap_match_python() {
         let tmp = tempfile::tempdir().expect("tmpdir");
@@ -1332,14 +1667,15 @@ mod tests {
             &[(2, 16, 64, 100.0), (2, 16, 128, 200.0)],
         );
         let table = WideEpTable::new(tmp.path().to_path_buf());
+        let leaves = [((16u32, 64u32), 103.0, 100.0), ((16, 128), 203.0, 200.0)];
         let hold = table
             .query_deepep_normal(2, 7168, 256, 8, 256, 16)
             .expect("query must succeed");
-        assert!((hold.dispatch_transmit_us - 400.0).abs() < 1e-9);
+        assert!((hold.dispatch_transmit_us - knn_hold_field(&leaves, 16, 256)).abs() < 1e-9);
         let snapped = table
             .query_deepep_normal(2, 7168, 96, 8, 256, 12)
             .expect("query must succeed");
-        assert!((snapped.dispatch_transmit_us - 150.0).abs() < 1e-9);
+        assert!((snapped.dispatch_transmit_us - knn_hold_field(&leaves, 12, 96)).abs() < 1e-9);
     }
 
     /// Item 3 (sm=20 fast path): `node_num == 1 && sms == 20` resolves the
@@ -1362,6 +1698,21 @@ mod tests {
             .query_deepep_normal(1, 7168, 96, 8, 256, 20)
             .expect("query must succeed");
         assert!((lerp.dispatch_transmit_us - 150.0).abs() < 1e-9);
+        let key = DispatchKey {
+            node_num: 1,
+            hidden_size: 7168,
+            num_topk: 8,
+            num_experts: 256,
+        };
+        assert!(table.load_deepep_normal().unwrap().by_keys[&key]
+            .direct_fields
+            .is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "dispatch curves must carry at least one token point")]
+    fn dispatch_points_reject_empty_curves() {
+        DispatchPoints::new(BTreeMap::new());
     }
 
     /// Duplicate coordinates (same sms + token) resolve FIRST-wins, mirroring
@@ -1399,12 +1750,31 @@ mod tests {
     fn alltoall_kernel_selection_matches_python() {
         let spec = gb200_spec();
         assert_eq!(select_alltoall_kernel(&spec, 4, 8, None), "NVLinkOneSided");
-        assert_eq!(select_alltoall_kernel(&spec, 4, 8, Some("WIDEEP")), "NVLinkTwoSided");
-        assert_eq!(select_alltoall_kernel(&spec, 4, 8, Some("DeepGemm")), "NotEnabled");
-        assert_eq!(select_alltoall_kernel(&spec, 4, 8, Some("cute_dsl")), "NotEnabled");
+        assert_eq!(
+            select_alltoall_kernel(&spec, 4, 8, Some("WIDEEP")),
+            "NVLinkTwoSided"
+        );
+        assert_eq!(
+            select_alltoall_kernel(&spec, 4, 8, Some("DeepGemm")),
+            "NotEnabled"
+        );
+        assert_eq!(
+            select_alltoall_kernel(&spec, 4, 8, Some("cute_dsl")),
+            "NotEnabled"
+        );
         let table = gb200_trtllm_table();
         let zero = table
-            .query_trtllm_alltoall(&spec, "alltoall_dispatch", 1, 7168, 8, 256, 4, MoeQuantMode::Fp8, Some("DEEPGEMM"))
+            .query_trtllm_alltoall(
+                &spec,
+                "alltoall_dispatch",
+                1,
+                7168,
+                8,
+                256,
+                4,
+                MoeQuantMode::Fp8,
+                Some("DEEPGEMM"),
+            )
             .expect("NotEnabled short-circuits");
         assert_eq!(zero, 0.0);
     }
@@ -1419,24 +1789,73 @@ mod tests {
         let table = gb200_trtllm_table();
         // WideEP -> NVLinkTwoSided; fp8 dispatch row (ep=4 -> node_num=1).
         let dispatch = table
-            .query_trtllm_alltoall(&spec, "alltoall_dispatch", 1, 7168, 8, 256, 4, MoeQuantMode::Fp8, Some("WIDEEP"))
+            .query_trtllm_alltoall(
+                &spec,
+                "alltoall_dispatch",
+                1,
+                7168,
+                8,
+                256,
+                4,
+                MoeQuantMode::Fp8,
+                Some("WIDEEP"),
+            )
             .expect("dispatch row");
-        assert!((dispatch - 0.011_372_800_171_375_274).abs() < 1e-12, "got {dispatch}");
+        assert!(
+            (dispatch - 0.011_372_800_171_375_274).abs() < 1e-12,
+            "got {dispatch}"
+        );
         // Same slice, combine phase: distinct value proves op_name keys the table.
         let combine = table
-            .query_trtllm_alltoall(&spec, "alltoall_combine", 1, 7168, 8, 256, 4, MoeQuantMode::Fp8, Some("WIDEEP"))
+            .query_trtllm_alltoall(
+                &spec,
+                "alltoall_combine",
+                1,
+                7168,
+                8,
+                256,
+                4,
+                MoeQuantMode::Fp8,
+                Some("WIDEEP"),
+            )
             .expect("combine row");
-        assert!((combine - 0.012_921_600_043_773_651).abs() < 1e-12, "got {combine}");
+        assert!(
+            (combine - 0.012_921_600_043_773_651).abs() < 1e-12,
+            "got {combine}"
+        );
         // fp8_block reuses the fp8 tables (Python `_normalize_quant_mode_for_table`).
         let block = table
-            .query_trtllm_alltoall(&spec, "alltoall_dispatch", 1, 7168, 8, 256, 4, MoeQuantMode::Fp8Block, Some("WIDEEP"))
+            .query_trtllm_alltoall(
+                &spec,
+                "alltoall_dispatch",
+                1,
+                7168,
+                8,
+                256,
+                4,
+                MoeQuantMode::Fp8Block,
+                Some("WIDEEP"),
+            )
             .expect("fp8_block reroutes to fp8");
         assert_eq!(block, dispatch);
         // Non-WideEP -> NVLinkOneSided (nvfp4-only slice, ep=2 -> node_num=1).
         let one_sided = table
-            .query_trtllm_alltoall(&spec, "alltoall_dispatch", 1, 7168, 8, 256, 2, MoeQuantMode::Nvfp4, None)
+            .query_trtllm_alltoall(
+                &spec,
+                "alltoall_dispatch",
+                1,
+                7168,
+                8,
+                256,
+                2,
+                MoeQuantMode::Nvfp4,
+                None,
+            )
             .expect("one-sided row");
-        assert!((one_sided - 0.012_895_999_848_842_621).abs() < 1e-12, "got {one_sided}");
+        assert!(
+            (one_sided - 0.012_895_999_848_842_621).abs() < 1e-12,
+            "got {one_sided}"
+        );
     }
 
     #[test]

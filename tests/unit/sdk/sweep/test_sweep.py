@@ -10,6 +10,7 @@ the unit coverage here targets local control flow and terminal classification.
 
 from unittest.mock import MagicMock
 
+import pandas as pd
 import pytest
 
 from aiconfigurator.sdk import config, sweep
@@ -65,6 +66,39 @@ def test_default_agg_batch_schedule_is_monotonic_and_capped():
     assert sorted(_DEFAULT_AGG_BATCH_SCHEDULE) == _DEFAULT_AGG_BATCH_SCHEDULE
     assert _DEFAULT_AGG_BATCH_SCHEDULE[0] == 1
     assert _DEFAULT_AGG_BATCH_SCHEDULE[-1] == 1024
+
+
+# ---------------------------------------------------------------------------
+# sweep_afd parameter forwarding
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_afd_forwards_max_a_batch_size(monkeypatch):
+    from aiconfigurator.sdk import pareto_analysis
+
+    captured = {}
+    expected = object()
+
+    def fake_afd_pareto(**kwargs):
+        captured.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(pareto_analysis, "afd_pareto", fake_afd_pareto)
+
+    result = sweep.sweep_afd(
+        model_path="Qwen/Qwen3-32B",
+        runtime_config=config.RuntimeConfig(isl=128, osl=32),
+        database=object(),
+        backend_name="trtllm",
+        model_config=config.ModelConfig(),
+        afd_parallel_config_list=[(1, 1, 2, 1, 3, "optimistic")],
+        gpus_per_node=8,
+        combined_with_pd=False,
+        max_a_batch_size=1536,
+    )
+
+    assert result is expected
+    assert captured["max_a_batch_size"] == 1536
 
 
 # ---------------------------------------------------------------------------
@@ -280,3 +314,41 @@ def test_sweep_disagg_rejects_empty_num_worker_lists():
             prefill_num_worker_list=[],
             decode_num_worker_list=[1, 2, 4],
         )
+
+
+def test_sweep_disagg_autoscale_forwards_degradation_factors(monkeypatch):
+    """The Task-facing sweep path must not drop calibrated autoscale factors."""
+    candidates = pd.DataFrame([{"candidate": 1}])
+    captured = {}
+
+    monkeypatch.setattr(sweep, "_get_disagg_worker_candidates", lambda **_kwargs: candidates)
+
+    def fake_pick_autoscale(**kwargs):
+        captured.update(kwargs)
+        return {"best_config_df": pd.DataFrame([{"selected": True}])}
+
+    monkeypatch.setattr("aiconfigurator.sdk.picking.pick_autoscale", fake_pick_autoscale)
+
+    result = sweep_disagg(
+        model_path="x",
+        runtime_config=config.RuntimeConfig(isl=128, osl=32, ttft=100.0, tpot=10.0),
+        prefill_database=object(),
+        prefill_backend_name="trtllm",
+        prefill_model_config=config.ModelConfig(),
+        prefill_parallel_config_list=[],
+        prefill_latency_correction=1.0,
+        decode_database=object(),
+        decode_backend_name="trtllm",
+        decode_model_config=config.ModelConfig(),
+        decode_parallel_config_list=[],
+        decode_latency_correction=1.0,
+        prefill_num_worker_list=[1],
+        decode_num_worker_list=[1],
+        autoscale=True,
+        rate_matching_prefill_degradation=0.61,
+        rate_matching_decode_degradation=0.73,
+    )
+
+    assert result.iloc[0]["selected"]
+    assert captured["prefill_degradation_factor"] == 0.61
+    assert captured["decode_degradation_factor"] == 0.73

@@ -171,11 +171,14 @@ def test_run_static_can_route_to_rust_engine_step_backend(
 
     def _fake_rust_breakdown(model_arg, database_arg, runtime_config_arg, mode_arg, stride_arg, scale_arg):
         calls.append((model_arg, database_arg, runtime_config_arg, mode_arg, stride_arg, scale_arg))
+        # 6-tuple: (ctx latency, gen latency, ctx energy, gen energy, ctx source, gen source)
         return (
-            {"rust_engine_step_context": 7.0},
-            {"rust_engine_step_generation": 3.0},
-            {"rust_engine_step_context": "rust"},
-            {"rust_engine_step_generation": "rust"},
+            {"context_qkv_gemm": 4.0, "context_attention": 3.0},
+            {"generation_qkv_gemm": 2.0, "generation_attention": 1.0},
+            {"context_qkv_gemm": 40.0, "context_attention": 8.0},
+            {"generation_qkv_gemm": 12.0, "generation_attention": 5.0},
+            {"context_qkv_gemm": "silicon", "context_attention": "empirical"},
+            {"generation_qkv_gemm": "silicon", "generation_attention": "mixed"},
         )
 
     monkeypatch.setattr(
@@ -183,6 +186,12 @@ def test_run_static_can_route_to_rust_engine_step_backend(
         "estimate_static_latency_breakdown_with_rust",
         _fake_rust_breakdown,
     )
+
+    def _phase_runner_trap(*args, **kwargs):
+        raise AssertionError("the rust path must never re-run the Python phase runners (not even for energy)")
+
+    monkeypatch.setattr(backend, "_run_context_phase", _phase_runner_trap)
+    monkeypatch.setattr(backend, "_run_generation_phase", _phase_runner_trap)
 
     summary = backend.run_static(
         model,
@@ -195,15 +204,15 @@ def test_run_static_can_route_to_rust_engine_step_backend(
 
     assert len(calls) == 1
     assert calls[0][3:] == ("static", 2, 1.25)
-    assert summary.get_context_latency_dict() == {"rust_engine_step_context": 7.0}
-    assert summary.get_generation_latency_dict() == {"rust_engine_step_generation": 3.0}
-    # Python phase runners supply energy (Rust tracks latency only).
-    # Context: (110.0 + 30.0) * scale=1.25 = 175.0
-    # Generation: 4 steps * (20.0 + 10.0) * scale=1.25 = 150.0
-    assert summary.get_context_energy_wms_dict() == {"rust_engine_step_context": pytest.approx(175.0)}
-    assert summary.get_generation_energy_wms_dict() == {"rust_engine_step_generation": pytest.approx(150.0)}
-    assert summary.get_context_source_dict() == {"rust_engine_step_context": "rust"}
-    assert summary.get_generation_source_dict() == {"rust_engine_step_generation": "rust"}
+    # Real op-name keys folded from the compiled engine's per-op results.
+    assert summary.get_context_latency_dict() == {"context_qkv_gemm": 4.0, "context_attention": 3.0}
+    assert summary.get_generation_latency_dict() == {"generation_qkv_gemm": 2.0, "generation_attention": 1.0}
+    # Per-op energies are real and DISTINCT per key — not one phase total
+    # smeared onto every key, and not recomputed by a Python double-eval.
+    assert summary.get_context_energy_wms_dict() == {"context_qkv_gemm": 40.0, "context_attention": 8.0}
+    assert summary.get_generation_energy_wms_dict() == {"generation_qkv_gemm": 12.0, "generation_attention": 5.0}
+    assert summary.get_context_source_dict() == {"context_qkv_gemm": "silicon", "context_attention": "empirical"}
+    assert summary.get_generation_source_dict() == {"generation_qkv_gemm": "silicon", "generation_attention": "mixed"}
 
 
 def test_run_agg_with_osl_one_does_not_divide_by_zero(
@@ -281,25 +290,87 @@ def test_run_mixed_returns_components_and_counts_speculative_query_tokens(
     assert calls[0]["x"] == 12
 
 
+def test_run_mixed_python_passes_filter_discarded_ops_and_keep_prefix_integral(
+    backend: BaseBackend,
+    model,
+    database,
+) -> None:
+    """Live-Python regression for the issue #1498 follow-through pair.
+
+    1. The three passes query ONLY the ops they consume: a raise in a
+       DISCARDED query (the generation-MoE low-token miss class) must not
+       block the estimate — pass 3 walks generation_attention alone, so the
+       raising non-attention generation op is never consulted.
+    2. Pass 1's prefix stays integral: `np.floor` yields a float64 that
+       would contaminate the ops' `s = isl - prefix`; a strict-int consumer
+       (the DSV4 CP composition chunks `s` with `range()`) is emulated by an
+       op that runs `range(s)` and rejects float coordinates.
+    """
+
+    class _RaisingDiscardedOp:
+        _name = "generation_moe"
+
+        def query(self, *args, **kwargs):
+            raise RuntimeError("low-token miss in a DISCARDED query must not block the estimate")
+
+    class _StrictIntOp(_StaticOp):
+        def query(self, *args, **kwargs) -> _LatencyResult:
+            assert not isinstance(kwargs["prefix"], float), "pass-1 prefix leaked as float"
+            range(kwargs["s"])  # raises TypeError on a float-contaminated s
+            return super().query(*args, **kwargs)
+
+    model.context_ops = [
+        _StaticOp("context_attention", latency_ms=11.0, energy_wms=110.0),
+        _StrictIntOp("context_mlp", latency_ms=3.0, energy_wms=30.0),
+    ]
+    model.generation_ops = [
+        _StaticOp("generation_attention", latency_ms=2.0, energy_wms=20.0),
+        _RaisingDiscardedOp(),
+    ]
+
+    estimate = backend.run_mixed(
+        model,
+        database,
+        RuntimeConfig(isl=8, osl=5, prefix=2),
+        MixedStepInput(context_tokens=8, num_decode_requests=2),
+    )
+
+    assert estimate.latency_ms > 0
+    # The discarded op was never queried (it would have raised), and its
+    # value is genuinely absent rather than smuggled in as 0.0.
+    assert "generation_moe" not in estimate.per_op_latency_ms
+
+
 def test_run_mixed_rust_path_returns_the_same_structured_contract(
     monkeypatch,
     backend: BaseBackend,
     model,
     database,
 ) -> None:
+    """The rust branch maps the bridge's rich dict 1:1 onto ``StepEstimate``:
+    real energy, per-component splits, and the Python branch's per-op keys
+    (raw non-attention names plus the two literal attention keys) — the
+    synthetic "rust_engine_step_mixed" key no longer exists."""
     from aiconfigurator.sdk.backends import base_backend as base_backend_module
 
     model._nextn = 2
     monkeypatch.setattr(base_backend_module, "should_use_rust_engine_step", lambda *args: True)
+    components = {
+        "latency_ms": 8.5,
+        "energy_wms": 85.0,
+        "component_latency_ms": {"shared_non_attention": 5.0, "context_attention": 2.0, "decode_attention": 1.5},
+        "component_energy_wms": {"shared_non_attention": 50.0, "context_attention": 20.0, "decode_attention": 15.0},
+        "per_op_latency_ms": {"context_mlp": 5.0, "context_attention (scaled)": 2.0, "generation_attention": 1.5},
+        "per_op_source": {
+            "context_mlp": "silicon",
+            "context_attention (scaled)": "empirical",
+            "generation_attention": "silicon",
+        },
+    }
     monkeypatch.setattr(
         base_backend_module,
         "estimate_mixed_step_breakdown_with_rust",
-        lambda *args, **kwargs: {
-            "total": 8.5,
-            "shared_non_attention": 5.0,
-            "context_attention": 2.0,
-            "decode_attention": 1.5,
-        },
+        lambda *args, **kwargs: components,
     )
 
     estimate = backend.run_mixed(
@@ -310,13 +381,59 @@ def test_run_mixed_rust_path_returns_the_same_structured_contract(
     )
 
     assert estimate.latency_ms == 8.5
-    assert estimate.component_latency_ms == {
-        "shared_non_attention": 5.0,
-        "context_attention": 2.0,
-        "decode_attention": 1.5,
-    }
+    assert estimate.energy_wms == 85.0  # real energy, not a 0.0 placeholder
+    assert estimate.component_latency_ms == components["component_latency_ms"]
+    assert estimate.component_energy_wms == components["component_energy_wms"]
+    assert estimate.per_op_latency_ms == components["per_op_latency_ms"]
+    assert "context_attention (scaled)" in estimate.per_op_latency_ms
+    assert estimate.per_op_source == components["per_op_source"]
+    assert estimate.context_tokens == 8
     assert estimate.num_decode_requests == 2
     assert estimate.num_decode_query_tokens == 6
+
+
+def test_get_genonly_step_latency_rust_path_returns_decode_breakdown_verbatim(
+    monkeypatch,
+    backend: BaseBackend,
+    model,
+    database,
+) -> None:
+    """The rust branch returns ``estimate_decode_step_breakdown_with_rust``
+    verbatim — real op names, real per-op energy (no synthetic
+    "rust_engine_step_generation" key) — without running the Python static
+    step."""
+    from aiconfigurator.sdk.backends import base_backend as base_backend_module
+
+    calls = []
+    breakdown = (
+        3.0,
+        24.0,
+        {"generation_attention": 2.0, "generation_mlp": 1.0},
+        {"generation_attention": "silicon", "generation_mlp": "empirical"},
+    )
+
+    def _fake_decode_breakdown(model_arg, database_arg, **kwargs):
+        calls.append(kwargs)
+        return breakdown
+
+    monkeypatch.setattr(base_backend_module, "estimate_decode_step_breakdown_with_rust", _fake_decode_breakdown)
+
+    def _python_step_trap(*args, **kwargs):
+        raise AssertionError("the rust path must not run the Python static step")
+
+    monkeypatch.setattr(backend, "run_static", _python_step_trap)
+
+    result = backend._get_genonly_step_latency(
+        model,
+        database,
+        RuntimeConfig(isl=8, osl=6, gen_seq_imbalance_correction_scale=1.25, engine_step_backend="rust"),
+        gen_tokens=4,
+        isl=8,
+        osl=6,
+    )
+
+    assert result == breakdown
+    assert calls == [{"gen_tokens": 4, "isl": 8, "osl": 6, "gen_seq_imbalance_correction_scale": 1.25}]
 
 
 def test_run_agg_applies_speculative_progress_in_scheduler(
@@ -548,17 +665,21 @@ def test_run_static_latency_only_skips_python_phase_runners_for_rust_path(
     model,
     database,
 ) -> None:
-    """include_energy=False must not invoke _run_context_phase or _run_generation_phase."""
+    """include_energy=False must not invoke _run_context_phase or
+    _run_generation_phase, and must zero the energy dicts while keeping their
+    key sets identical to the latency dicts."""
     from aiconfigurator.sdk.backends import base_backend as base_backend_module
 
     monkeypatch.setattr(
         base_backend_module,
         "estimate_static_latency_breakdown_with_rust",
         lambda *args, **kwargs: (
-            {"rust_engine_step_context": 7.0},
-            {"rust_engine_step_generation": 3.0},
-            {"rust_engine_step_context": "rust"},
-            {"rust_engine_step_generation": "rust"},
+            {"context_qkv_gemm": 4.0, "context_attention": 3.0},
+            {"generation_qkv_gemm": 2.0, "generation_attention": 1.0},
+            {"context_qkv_gemm": 40.0, "context_attention": 8.0},
+            {"generation_qkv_gemm": 12.0, "generation_attention": 5.0},
+            {"context_qkv_gemm": "silicon", "context_attention": "empirical"},
+            {"generation_qkv_gemm": "silicon", "generation_attention": "mixed"},
         ),
     )
 
@@ -567,14 +688,33 @@ def test_run_static_latency_only_skips_python_phase_runners_for_rust_path(
     monkeypatch.setattr(backend, "_run_context_phase", ctx_phase)
     monkeypatch.setattr(backend, "_run_generation_phase", gen_phase)
 
-    backend.run_static_latency_only(
+    runtime_config = RuntimeConfig(batch_size=2, beam_width=1, isl=8, osl=5, prefix=2, engine_step_backend="rust")
+    latency = backend.run_static_latency_only(
         model,
         database,
-        RuntimeConfig(batch_size=2, beam_width=1, isl=8, osl=5, prefix=2, engine_step_backend="rust"),
+        runtime_config,
         mode="static",
         stride=2,
     )
+    assert latency == pytest.approx(10.0)
 
+    (
+        context_latency,
+        context_energy,
+        generation_latency,
+        generation_energy,
+        _,
+        _,
+    ) = backend._run_static_breakdown(model, database, runtime_config, mode="static", stride=2, include_energy=False)
+    # Latency-only callers must not observe energy, but the key sets stay
+    # paired with the latency dicts (the power coverage gate pairs by name).
+    assert context_energy == {"context_qkv_gemm": 0.0, "context_attention": 0.0}
+    assert generation_energy == {"generation_qkv_gemm": 0.0, "generation_attention": 0.0}
+    assert context_energy.keys() == context_latency.keys()
+    assert generation_energy.keys() == generation_latency.keys()
+
+    # The old rust-path energy compensation re-ran the Python phases "for
+    # energy only"; that double evaluation is gone on every rust-path call.
     ctx_phase.assert_not_called()
     gen_phase.assert_not_called()
 

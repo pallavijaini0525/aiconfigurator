@@ -10,13 +10,13 @@
 //! The MHC module is collected as a single fused kernel; this operator scales
 //! the raw latency by `scale_factor`.
 
-use serde::{Deserialize, Serialize};
 use crate::common::enums::{DatabaseMode, GemmQuantMode};
 use crate::common::error::AicError;
 use crate::operators::base::{PerformanceResult, Source};
 use crate::operators::util_empirical::{self, UtilGrid};
-use crate::perf_database::gemm::tc_flops_for_compute;
+use crate::perf_database::gemm::quant_tc_flops;
 use crate::perf_database::PerfDatabase;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MhcModuleOp {
@@ -40,6 +40,12 @@ pub struct MhcModuleOp {
     /// bfloat16 today). Enters the SOL's flops + byte terms.
     #[serde(default = "default_quant_mode")]
     pub quant_mode: GemmQuantMode,
+    /// CP sequence-shard factor (Python's `_seq_split`, = `cp_size` for the
+    /// context mHC ops): the mHC module is token-major, so the per-rank
+    /// payload is `ceil(num_tokens / seq_split)` (Python
+    /// `DeepSeekV4MHCModule.query`). Defaults to 1.
+    #[serde(default = "crate::operators::gemm::default_seq_split")]
+    pub seq_split: u32,
 }
 
 fn default_sinkhorn_iters() -> u32 {
@@ -67,6 +73,7 @@ impl MhcModuleOp {
             architecture: architecture.into(),
             sinkhorn_iters: default_sinkhorn_iters(),
             quant_mode: default_quant_mode(),
+            seq_split: 1,
         }
     }
 
@@ -76,7 +83,7 @@ impl MhcModuleOp {
     /// table only ever calls this with `"pre"` / `"post"` (op="both" is
     /// summed at the query level, each half with its own SOL) but the
     /// `"both"` arm is kept for formula completeness.
-    fn sol_ms(&self, db: &PerfDatabase, op_name: &str, nt: i64) -> f64 {
+    fn sol_ms(&self, db: &PerfDatabase, op_name: &str, nt: i64, tc_flops: f64) -> f64 {
         let sites: i128 = 2;
         let nt = nt as i128;
         let hc = self.hc_mult as i128;
@@ -106,8 +113,7 @@ impl MhcModuleOp {
         }
 
         let spec = &db.system_spec;
-        let sol_math =
-            ops as f64 / tc_flops_for_compute(spec, self.quant_mode.mapping().compute) * 1000.0;
+        let sol_math = ops as f64 / tc_flops * 1000.0;
         let sol_mem = (param_bytes + activation_bytes) / spec.gpu.mem_bw * 1000.0;
         sol_math.max(sol_mem)
     }
@@ -115,28 +121,42 @@ impl MhcModuleOp {
     /// Database-mode dispatch mirroring Python `_query_mhc_table`
     /// (`operations/dsv4.py`): SILICON queries the table; HYBRID converts a
     /// typed silicon miss into the util-space empirical estimate; EMPIRICAL
-    /// always estimates. The SOL diagnostic modes never reach the compiled
-    /// engine (the routing gate delegates them to the Python step).
+    /// always estimates; SOL (and the retired SOL_FULL alias) returns the
+    /// pure analytic roofline with `Source::Sol` and zero energy.
     pub fn query(&self, db: &PerfDatabase, num_tokens: u32) -> Result<PerformanceResult, AicError> {
-        let sol = |op_name: &str, t: f64| self.sol_ms(db, op_name, t.round() as i64);
+        // CP: per-rank token count (ceil = busiest rank). Python divides x
+        // BEFORE `_query_mhc_table`, so SOL/silicon/empirical all see the
+        // per-rank count (`DeepSeekV4MHCModule.query`, dsv4.py).
+        let num_tokens = num_tokens.div_ceil(self.seq_split.max(1));
+        let tc_flops = quant_tc_flops(&db.system_spec, self.quant_mode.mapping())?;
+        let sol = |op_name: &str, t: f64| self.sol_ms(db, op_name, t.round() as i64, tc_flops);
         let silicon = || {
             db.mhc
                 .query_module(&self.op, num_tokens, self.hc_mult, self.hidden_size, &sol)
+                .map(|v| PerformanceResult::with_energy(v.latency, v.energy, Source::Silicon))
         };
-        let (latency, source) = match db.database_mode {
-            DatabaseMode::Empirical => (self.mhc_empirical(db, num_tokens)?, Source::Empirical),
+        let result = match db.database_mode {
+            // Python `_query_mhc_table`: `get_sol()[0]` at the pre-bound
+            // `(nt=num_tokens, op_name=self.op)` — for op == "both" the SOL
+            // is the single fused `pre_ops + post_ops` roofline, NOT the
+            // empirical path's pre+post sum of estimates.
+            DatabaseMode::Sol | DatabaseMode::SolFull => PerformanceResult::new(
+                self.sol_ms(db, &self.op, i64::from(num_tokens), tc_flops),
+                Source::Sol,
+            ),
+            DatabaseMode::Empirical => {
+                PerformanceResult::new(self.mhc_empirical(db, num_tokens)?, Source::Empirical)
+            }
             DatabaseMode::Hybrid => match silicon() {
-                Ok(latency) => (latency, Source::Silicon),
+                Ok(result) => result,
                 Err(err) if err.is_missing_perf_data() => {
-                    (self.mhc_empirical(db, num_tokens)?, Source::Empirical)
+                    PerformanceResult::new(self.mhc_empirical(db, num_tokens)?, Source::Empirical)
                 }
                 Err(err) => return Err(err),
             },
-            _ => (silicon()?, Source::Silicon),
+            _ => silicon()?,
         };
-        Ok(PerformanceResult::new(latency, source)
-            .clamp_non_negative()
-            .scaled(self.scale_factor))
+        Ok(result.clamp_non_negative().scaled(self.scale_factor))
     }
 
     /// Mirrors Python `_query_mhc_table::get_empirical`: for `op == "both"`
@@ -154,8 +174,14 @@ impl MhcModuleOp {
     /// `SOL(query)/util` over one op half's own `(num_tokens,)` curve.
     /// Mirrors Python `_query_mhc_table::get_empirical::_emp_for_op` (grid
     /// depth 1, `sol_fn = lambda c: get_sol(c[0], op_name)[0]`).
-    fn emp_for_op(&self, db: &PerfDatabase, op_name: &str, num_tokens: u32) -> Result<f64, AicError> {
-        let sol = |c: &[f64]| self.sol_ms(db, op_name, c[0].round() as i64);
+    fn emp_for_op(
+        &self,
+        db: &PerfDatabase,
+        op_name: &str,
+        num_tokens: u32,
+    ) -> Result<f64, AicError> {
+        let tc_flops = quant_tc_flops(&db.system_spec, self.quant_mode.mapping())?;
+        let sol = |c: &[f64]| self.sol_ms(db, op_name, c[0].round() as i64, tc_flops);
         // Python keys the grid on (op_name, hc_mult, hidden_size, quant) —
         // NOT sinkhorn_iters, which is mirrored deliberately.
         let key = format!(
@@ -165,8 +191,13 @@ impl MhcModuleOp {
             self.quant_mode.name()
         );
         let grid = db.util_grids.get_or_try_build(&key, || {
-            match db.mhc.module_points(op_name, self.hc_mult, self.hidden_size) {
-                Ok(points) => Ok(Some(UtilGrid::new(util_empirical::build_samples(points, sol)))),
+            match db
+                .mhc
+                .module_points(op_name, self.hc_mult, self.hidden_size)
+            {
+                Ok(points) => Ok(Some(UtilGrid::new(util_empirical::build_samples(
+                    points, sol,
+                )))),
                 // Typed coverage miss -> no grid (estimate() raises the
                 // empirical miss); schema/load errors propagate.
                 Err(err) if err.is_missing_perf_data() => Ok(None),
@@ -203,6 +234,7 @@ mod tests {
             architecture: "DeepseekV4ForCausalLM".into(),
             sinkhorn_iters: 20,
             quant_mode: GemmQuantMode::Bfloat16,
+            seq_split: 1,
         }
     }
 
@@ -253,7 +285,10 @@ mod tests {
     fn mhc_in_range_unchanged_by_roofline() {
         let db = b200_sglang_db();
         for &(nt, expected) in &[(3u32, 0.025050000000000003), (8u32, 0.0251)] {
-            let got = mhc_op("pre").query(&db, nt).expect("query must succeed").latency_ms;
+            let got = mhc_op("pre")
+                .query(&db, nt)
+                .expect("query must succeed")
+                .latency_ms;
             assert!(
                 ((got - expected) / expected).abs() < 1e-9,
                 "nt={nt}: rust {got} vs python {expected}"
@@ -340,6 +375,54 @@ mod tests {
         );
     }
 
+    /// CP (issue #1498): the mHC module is token-major, so `seq_split = cp`
+    /// divides the queried token count (ceil = busiest rank) BEFORE the
+    /// table/SOL/empirical dispatch — exactly Python
+    /// `DeepSeekV4MHCModule.query`'s `-(-x // self._seq_split)`. The missing
+    /// division was 100% of the DSV4 CSA CP static_ctx divergence (python
+    /// 42.430756 vs rust 56.943256 ms). Python oracle:
+    ///
+    /// ```text
+    /// uv run --no-sync python3 -c "
+    /// from aiconfigurator.sdk import perf_database, common
+    /// from aiconfigurator.sdk.operations.dsv4 import DeepSeekV4MHCModule
+    /// db = perf_database.get_database('b200_sxm', 'sglang', '0.5.10')
+    /// for opn, x, split in [('pre',8192,8),('post',8192,8),('pre',8193,8),('both',8192,8),('pre',8192,1)]:
+    ///     op = DeepSeekV4MHCModule('mhc_cp', 1.0, opn, 7168, 4, 20,
+    ///                              common.GEMMQuantMode.bfloat16, seq_split=split)
+    ///     print(opn, x, split, repr(float(op.query(db, x=x))))"
+    /// ```
+    ///
+    /// Covers: pre/post/both at the shard count (8192/8 = 1024, a collected
+    /// point), the ceil rounding (8193 -> 1025, off-grid lerp), and the
+    /// `seq_split=1` identity (equals the plain full-token query).
+    #[test]
+    fn mhc_seq_split_divides_tokens_like_python_cp() {
+        let db = b200_sglang_db();
+        let cases: &[(&str, u32, u32, f64)] = &[
+            ("pre", 8192, 8, 0.1029),
+            ("post", 8192, 8, 0.0543),
+            ("pre", 8193, 8, 0.103024609375),
+            ("both", 8192, 8, 0.1572),
+            ("pre", 8192, 1, 0.6357),
+        ];
+        for &(op_name, x, split, expected) in cases {
+            let mut op = mhc_op(op_name);
+            op.seq_split = split;
+            let got = op.query(&db, x).expect("query must succeed").latency_ms;
+            assert!(
+                ((got - expected) / expected).abs() < 1e-9,
+                "op={op_name}, x={x}, seq_split={split}: rust {got} vs python {expected}"
+            );
+        }
+        // seq_split=8 at x=8192 must equal the direct per-rank query.
+        let direct = mhc_op("pre")
+            .query(&db, 1024)
+            .expect("direct query")
+            .latency_ms;
+        assert_eq!(direct, 0.1029);
+    }
+
     /// `sinkhorn_iters` / `quant_mode` are new opspec fields; old specs lack
     /// them and must default to (20, bfloat16).
     #[test]
@@ -348,8 +431,33 @@ mod tests {
         let obj = v.as_object_mut().expect("object");
         obj.remove("sinkhorn_iters");
         obj.remove("quant_mode");
+        obj.remove("seq_split");
         let de: MhcModuleOp = serde_json::from_value(v).expect("deserialize");
         assert_eq!(de.sinkhorn_iters, 20);
         assert_eq!(de.quant_mode, GemmQuantMode::Bfloat16);
+        assert_eq!(de.seq_split, 1);
+    }
+
+    /// SOL mode returns the fused mHC roofline tagged `Source::Sol` — for
+    /// `op == "both"` the SINGLE `pre_ops + post_ops` formula, NOT the
+    /// empirical path's pre+post sum of estimates (Python `_query_mhc_table`
+    /// SOL branch calls `get_sol()` once at the bound op name).
+    #[test]
+    fn mhc_sol_mode_returns_fused_roofline_with_sol_source() {
+        let mut db = b200_sglang_db();
+        db.database_mode = DatabaseMode::Sol;
+        let op = mhc_op("both");
+        let tc_flops = quant_tc_flops(&db.system_spec, op.quant_mode.mapping()).unwrap();
+        let result = op.query(&db, 512).expect("mhc sol");
+        let expected = op.sol_ms(&db, "both", 512, tc_flops);
+        assert_eq!(result.latency_ms, expected);
+        assert_eq!(result.source, Source::Sol);
+        assert_eq!(result.energy_wms, 0.0);
+        // Fused "both" == pre + post SOL (linear in ops and bytes), and both
+        // halves are individually positive.
+        let pre = op.sol_ms(&db, "pre", 512, tc_flops);
+        let post = op.sol_ms(&db, "post", 512, tc_flops);
+        assert!(pre > 0.0 && post > 0.0);
+        assert!(expected <= pre + post + 1e-12);
     }
 }
