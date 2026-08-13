@@ -3,14 +3,14 @@
 
 data_dir: data/b70 # relative to systems_dir
 gpu:
-  mem_bw: 456000000000 # 456GB/s
+  mem_bw: 608000000000 # 608GB/s - Intel Arc Pro B70 spec
   mem_bw_empirical_scaling_factor: 0.5 # standalone kernel bench shows ~220GB/s effective BW for mem-bound ops (RMSNorm/SiLU/Rotary), ~48% of 456GB/s spec
   mem_empirical_constant_latency: 0.000003 # 3us some nonofficial correction based on observations, you should try to modify based on your own observations
-  mem_capacity: 25769803776 # 24GiB
-  float32_tc_flops: 12280000000000 # 12.28TFLOPS
-  bfloat16_tc_flops: 98304000000000 # 98.3TFLOPS
-  int8_tc_flops: 197000000000000 # 197TOPS
-  power: 200 # Watt (Total Board Power)
+  mem_capacity: 32000000000 # 32GB - Intel Arc Pro B70 spec
+  float32_tc_flops: 22940000000000 # 22.94TFLOPS FP32 - Intel Arc Pro B70 spec
+  bfloat16_tc_flops: 183500000000000 # ~183.5TFLOPS BF16 - estimated as Int8(367TOPS)/2 for XMX architecture
+  int8_tc_flops: 367000000000000 # 367TOPS Int8 - Intel Arc Pro B70 spec
+  power: 230 # Watt (Total Board Power) - Intel Arc Pro B70 spec
 
 node:
   num_gpus_per_node: 8 # check your # cards with sycl-ls

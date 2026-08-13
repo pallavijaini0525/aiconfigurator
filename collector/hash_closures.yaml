@@ -149,6 +149,16 @@ collector.vllm.collect_mla_module:
 collector.vllm.collect_moe:
   - collector/cases/base_ops/moe.yaml
   - __model_cases__
+collector.vllm.collect_attn_xpu:
+  - collector/cases/base_ops/attention_context.yaml
+  - collector/cases/base_ops/attention_generation.yaml
+  - __model_cases__
+collector.vllm.collect_gemm_xpu:
+  - collector/cases/base_ops/gemm.yaml
+  - __model_cases__
+collector.vllm.collect_moe_xpu:
+  - collector/cases/base_ops/moe.yaml
+  - __model_cases__
 
 # --- wideep -----------------------------------------------------------
 collector.wideep.sglang.collect_deepep_moe:
